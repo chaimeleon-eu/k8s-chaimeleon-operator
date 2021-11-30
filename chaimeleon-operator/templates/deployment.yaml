@@ -43,7 +43,7 @@ spec:
             - name: DATASET_SERVICE_ENDPOINT
               value: "{{ .Values.operatorConfiguration.datasetServiceEndpoint }}"
             - name: K8S_USER_PREFIX
-              value: {{- include "chaimeleon-operator.k8sUserPrefix" . }}
+              value: "{{- include "chaimeleon-operator.k8sUserPrefix" . }}"
             - name: OPERATOR_SERVICE_ACCOUNT_NAME
               value: {{ include "chaimeleon-operator.serviceAccountName" . }}
             - name: OPERATOR_SERVICE_ACCOUNT_NAMESPACE
