@@ -25,6 +25,7 @@ operatorConfiguration:
   keycloakEndpoint: ""
   keycloakRealm: ""
   datasetServiceEndpoint: ""
+  k8sUserPrefix: ""
   
 
 service:

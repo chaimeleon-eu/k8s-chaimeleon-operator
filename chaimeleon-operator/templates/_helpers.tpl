@@ -54,7 +54,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 Create the name of the service account to use
 */}}
 {{- define "chaimeleon-operator.serviceAccountName" -}}
-{{- default (include "chaimeleon-operator.fullname" .) .Values.serviceAccount.name }}
+{{- default (include "chaimeleon-operator.fullname" .) .Values.serviceAccount.name -}}
 {{- end }}
 
 
@@ -62,33 +62,33 @@ Create the name of the service account to use
 Create the name of the role
 */}}
 {{- define "chaimeleon-operator.roleName" -}}
-{{- default "chaimeleon-operator-role-namespaced" .Values.rbac.role.name }}
+{{- default "chaimeleon-operator-role-namespaced" .Values.rbac.role.name -}}
 {{- end }}
 
 {{/*
 Create the name of the ClusterRole
 */}}
 {{- define "chaimeleon-operator.clusterRoleName" -}}
-{{- default "chaimeleon-operator-role-cluster" .Values.rbac.clusterRole.name }}
+{{- default "chaimeleon-operator-role-cluster" .Values.rbac.clusterRole.name -}}
 {{- end }}
 
 {{/*
 Create the name of the roleBinding
 */}}
 {{- define "chaimeleon-operator.roleBindingName" -}}
-{{- default "chaimeleon-operator-roleBinding" .Values.rbac.roleBinding.name }}
+{{- default "chaimeleon-operator-roleBinding" .Values.rbac.roleBinding.name -}}
 {{- end }}
 
 {{/*
 Create the name of the ClusterRoleBinding
 */}}
 {{- define "chaimeleon-operator.clusterRoleBindingName" -}}
-{{- default "chaimeleon-operator-clusterRoleBinding" .Values.rbac.clusterRoleBinding.name }}
+{{- default "chaimeleon-operator-clusterRoleBinding" .Values.rbac.clusterRoleBinding.name -}}
 {{- end }}
 
 {{/*
 Create the name of k8s prefix
 */}}
 {{- define "chaimeleon-operator.k8sUserPrefix" -}}
-{{- default "" .Values.rbac.clusterRoleBinding.name -}}
+{{- default "" .Values.operatorConfiguration.k8sUserPrefix -}}
 {{- end }}
