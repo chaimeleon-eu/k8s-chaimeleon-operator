@@ -54,12 +54,9 @@ spec:
               protocol: TCP
           livenessProbe:
             httpGet:
-              path: /
-              port: https
-          readinessProbe:
-            httpGet:
-              path: /
-              port: https
+              path: /healthz
+              port: 8080
+
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
 
