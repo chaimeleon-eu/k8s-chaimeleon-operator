@@ -8,7 +8,7 @@ import os
 import requests
 import time
 
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.0.1"
 
 LOCK = None
 LOCAL_STORAGE = {}
@@ -128,16 +128,28 @@ def remove_fn(spec, name, namespace, logger, body, uid, **kwargs):
         else:
             logger.error( "uid={uid} -> Finalise accessing dataset unsuccessfully traced: User={username}, tool={toolName}:{toolVersion} , datasets:{datasets}".format(uid=uid, username=username, toolName=MY_VALIDATION_INFO["toolName"], toolVersion=MY_VALIDATION_INFO["toolVersion"], datasets=str(MY_VALIDATION_INFO["datasetsID"])) )
 
-@kopf.on.validate('apps/v1', 'deployments', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT})
-def validate_deployment_fn(spec, logger, userinfo, body, warnings, headers, uid, annotations, **kwargs):
+@kopf.on.validate('apps/v1', 'deployments', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT}, operation='CREATE')
+def validate_create_deployment_fn(spec, logger, userinfo, body, warnings, headers, uid, annotations, **kwargs):
     global OPERATOR_SERVICE_ACCOUNT_NAME, OPERATOR_SERVICE_ACCOUNT_NAMESPACE
     if (userinfo['username'] != "system:serviceaccount:{namespace}:{service_account}".format(namespace=OPERATOR_SERVICE_ACCOUNT_NAMESPACE, service_account=OPERATOR_SERVICE_ACCOUNT_NAME)):
         validate(spec, logger, userinfo, body, warnings, headers, uid, annotations)
 
-@kopf.on.validate('batch/v1', 'jobs', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT})
-def validate_job_fn(spec, logger, userinfo, body, warnings, headers, uid, annotations, **kwargs):
+@kopf.on.validate('batch/v1', 'jobs', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT}, operation='CREATE')
+def validate_create_job_fn(spec, logger, userinfo, body, warnings, headers, uid, annotations, **kwargs):
+    global OPERATOR_SERVICE_ACCOUNT_NAME, OPERATOR_SERVICE_ACCOUNT_NAMESPACE
+    if (userinfo['username'] != "system:serviceaccount:{namespace}:{service_account}".format(namespace=OPERATOR_SERVICE_ACCOUNT_NAMESPACE, service_account=OPERATOR_SERVICE_ACCOUNT_NAME)) :
+        validate(spec, logger, userinfo, body, warnings, headers, uid, annotations)
+
+@kopf.on.validate('apps/v1', 'deployments', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT}, operation='UPDATE')
+def validate_update_deployment_fn(spec, logger, userinfo, body, warnings, headers, uid, annotations, **kwargs):
     global OPERATOR_SERVICE_ACCOUNT_NAME, OPERATOR_SERVICE_ACCOUNT_NAMESPACE
     if (userinfo['username'] != "system:serviceaccount:{namespace}:{service_account}".format(namespace=OPERATOR_SERVICE_ACCOUNT_NAMESPACE, service_account=OPERATOR_SERVICE_ACCOUNT_NAME)):
+        validate(spec, logger, userinfo, body, warnings, headers, uid, annotations)
+
+@kopf.on.validate('batch/v1', 'jobs', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT}, operation='UPDATE')
+def validate_update_job_fn(spec, logger, userinfo, body, warnings, headers, uid, annotations, **kwargs):
+    global OPERATOR_SERVICE_ACCOUNT_NAME, OPERATOR_SERVICE_ACCOUNT_NAMESPACE
+    if (userinfo['username'] != "system:serviceaccount:{namespace}:{service_account}".format(namespace=OPERATOR_SERVICE_ACCOUNT_NAMESPACE, service_account=OPERATOR_SERVICE_ACCOUNT_NAME)) :
         validate(spec, logger, userinfo, body, warnings, headers, uid, annotations)
 
 def validate(spec, logger, userinfo, body, warnings, headers, uid, annotations):
