@@ -8,7 +8,7 @@ import os
 import requests
 import time
 
-__VERSION__ = "1.0.1"
+__VERSION__ = "1.0.2"
 
 LOCK = None
 LOCAL_STORAGE = {}
@@ -263,7 +263,7 @@ def check_access_dataset(logger, access_token, username, datasets_list):
 def check_gid_user(logger, access_token, username, gid):
     global DATASET_SERVICE_ENDPOINT, DATASET_SERVICE_MAX_RETRIES
 
-    URL = "{endpoint}/api/user/{username}".format(endpoint=DATASET_SERVICE_ENDPOINT, username=username) 
+    URL = "{endpoint}/api/users/{username}".format(endpoint=DATASET_SERVICE_ENDPOINT, username=username) 
     headers= { "Content-Type": "application/json", "Accept": "application/json", "Authorization": "bearer %s" % (access_token)  }
 
     response =  do_request_post(URL, "GET" , logger, DATASET_SERVICE_MAX_RETRIES, headers=headers, verify=False)

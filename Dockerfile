@@ -1,6 +1,6 @@
 FROM python:3.7
 LABEL maintainer=serlohu@upv.es
-ARG kopf_version='1.35.3'
+ARG kopf_version='1.35.4'
 
 
 #RUN apt-get update && apt-get install -y python3 python3-pip
