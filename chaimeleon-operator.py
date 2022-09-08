@@ -86,8 +86,7 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     logger.info( "Chaimeleon operator (v{version}) options: KEYCLOAK_CLIENT={keycloak_client}, KEYCLOAK_ENDPOINT={keycloak_endpoint}, KEYCLOAK_REALM={realm}, DATASET_SERVICE_ENDPOINT={dataset_endpoint}, K8S_USER_PREFIX='{user_prefix}'".format(version=__VERSION__, keycloak_client=KEYCLOAK_CLIENT, keycloak_endpoint=KEYCLOAK_ENDPOINT, realm=KEYCLOAK_REALM, dataset_endpoint=DATASET_SERVICE_ENDPOINT, user_prefix=K8S_USER_PREFIX ) )
 
 @kopf.on.create('apps/v1', 'deployments', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT})
-@kopf.on.create('batch/v1', 'jobs', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT})
-def create_fn(spec, name, namespace, logger, body, uid, **kwargs):
+def create_fn_deployment(spec, name, namespace, logger, body, uid, **kwargs):
     global LOCK, LOCAL_STORAGE, KEYCLOAK_CLIENT, K8S_USER_PREFIX
 
     MY_VALIDATION_INFO = None
@@ -107,9 +106,30 @@ def create_fn(spec, name, namespace, logger, body, uid, **kwargs):
         else:
             logger.error( "uid={uid} -> Access dataset unsuccessfully traced: User={username}, tool={toolName}:{toolVersion} , datasets:{datasets}".format(uid=uid, username=keycloak_username, toolName=MY_VALIDATION_INFO["toolName"], toolVersion=MY_VALIDATION_INFO["toolVersion"], datasets=str(MY_VALIDATION_INFO["datasetsID"])) )
 
+@kopf.on.create('batch/v1', 'jobs', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT})
+def create_fn_jobs(spec, name, namespace, logger, body, uid, **kwargs):
+    global LOCK, LOCAL_STORAGE, KEYCLOAK_CLIENT, K8S_USER_PREFIX
+
+    MY_VALIDATION_INFO = None
+    LOCK.acquire(blocking=True)
+    if uid in LOCAL_STORAGE:
+        MY_VALIDATION_INFO = LOCAL_STORAGE[uid]
+    else:
+        logger.error("Someone is deploying an app with uid=%s that was not correctly validated, we are not able to trace this dataset access" % (uid) )
+    LOCK.release()
+    
+    if MY_VALIDATION_INFO != None:
+        access_token = get_access_token(logger)
+        username = dict(MY_VALIDATION_INFO["userinfo"])["username"]
+        keycloak_username = username[ len(K8S_USER_PREFIX): ]
+        if access_dataset(logger, access_token, uid, keycloak_username, MY_VALIDATION_INFO["datasetsID"], MY_VALIDATION_INFO["toolName"], MY_VALIDATION_INFO["toolVersion"]):
+            logger.info( "uid={uid} -> Access dataset successfully traced: User={username}, tool={toolName}:{toolVersion} , datasets:{datasets}".format(uid=uid, username=keycloak_username, toolName=MY_VALIDATION_INFO["toolName"], toolVersion=MY_VALIDATION_INFO["toolVersion"], datasets=str(MY_VALIDATION_INFO["datasetsID"])) )
+        else:
+            logger.error( "uid={uid} -> Access dataset unsuccessfully traced: User={username}, tool={toolName}:{toolVersion} , datasets:{datasets}".format(uid=uid, username=keycloak_username, toolName=MY_VALIDATION_INFO["toolName"], toolVersion=MY_VALIDATION_INFO["toolVersion"], datasets=str(MY_VALIDATION_INFO["datasetsID"])) )
+
+
 @kopf.on.delete('apps/v1', 'deployments', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT})
-@kopf.on.delete('batch/v1', 'jobs', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT})
-def remove_fn(spec, name, namespace, logger, body, uid, **kwargs):
+def remove_fn_deployments(spec, name, namespace, logger, body, uid, **kwargs):
     global LOCK, LOCAL_STORAGE, KEYCLOAK_CLIENT
 
     MY_VALIDATION_INFO = None
@@ -127,6 +147,27 @@ def remove_fn(spec, name, namespace, logger, body, uid, **kwargs):
             logger.info( "uid={uid} -> Finalise accessing dataset successfully traced: User={username}, tool={toolName}:{toolVersion} , datasets:{datasets}".format(username=username, toolName=MY_VALIDATION_INFO["toolName"], toolVersion=MY_VALIDATION_INFO["toolVersion"], datasets=str(MY_VALIDATION_INFO["datasetsID"])) )
         else:
             logger.error( "uid={uid} -> Finalise accessing dataset unsuccessfully traced: User={username}, tool={toolName}:{toolVersion} , datasets:{datasets}".format(uid=uid, username=username, toolName=MY_VALIDATION_INFO["toolName"], toolVersion=MY_VALIDATION_INFO["toolVersion"], datasets=str(MY_VALIDATION_INFO["datasetsID"])) )
+
+@kopf.on.delete('batch/v1', 'jobs', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT})
+def remove_fn_jobs(spec, name, namespace, logger, body, uid, **kwargs):
+    global LOCK, LOCAL_STORAGE, KEYCLOAK_CLIENT
+
+    MY_VALIDATION_INFO = None
+    LOCK.acquire(blocking=True)
+    if uid in LOCAL_STORAGE:
+        MY_VALIDATION_INFO = LOCAL_STORAGE[uid]
+    else:
+        logger.error("Someone is deleting an app with uid=%s that was not correctly validated, we are not able to trace this dataset access" % (uid) )
+    LOCK.release()
+    
+    if MY_VALIDATION_INFO != None:
+        username = dict(MY_VALIDATION_INFO["userinfo"])["username"]
+        access_token = get_access_token(logger)    
+        if finalise_access_dataset(logger, access_token, uid):
+            logger.info( "uid={uid} -> Finalise accessing dataset successfully traced: User={username}, tool={toolName}:{toolVersion} , datasets:{datasets}".format(username=username, toolName=MY_VALIDATION_INFO["toolName"], toolVersion=MY_VALIDATION_INFO["toolVersion"], datasets=str(MY_VALIDATION_INFO["datasetsID"])) )
+        else:
+            logger.error( "uid={uid} -> Finalise accessing dataset unsuccessfully traced: User={username}, tool={toolName}:{toolVersion} , datasets:{datasets}".format(uid=uid, username=username, toolName=MY_VALIDATION_INFO["toolName"], toolVersion=MY_VALIDATION_INFO["toolVersion"], datasets=str(MY_VALIDATION_INFO["datasetsID"])) )
+
 
 @kopf.on.validate('apps/v1', 'deployments', annotations={'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT}, operation='CREATE')
 def validate_create_deployment_fn(spec, logger, userinfo, body, warnings, headers, uid, annotations, **kwargs):
