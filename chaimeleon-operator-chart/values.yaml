@@ -27,6 +27,8 @@ operatorConfiguration:
   keycloakEndpoint: ""
   keycloakRealm: ""
   datasetServiceEndpoint: ""
+  # Optional, set only if you have an endpoint for testing
+  datasetServiceTestEndpoint: ""
   k8sUserPrefix: ""
   
 

@@ -6,6 +6,8 @@ metadata:
     {{- include "chaimeleon-operator.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "chaimeleon-operator.selectorLabels" . | nindent 6 }}
@@ -43,6 +45,8 @@ spec:
               value: "{{ .Values.operatorConfiguration.keycloakRealm }}"
             - name: DATASET_SERVICE_ENDPOINT
               value: "{{ .Values.operatorConfiguration.datasetServiceEndpoint }}"
+            - name: DATASET_SERVICE_TEST_ENDPOINT
+              value: "{{ .Values.operatorConfiguration.datasetServiceTestEndpoint }}"
             - name: K8S_USER_PREFIX
               value: "{{- include "chaimeleon-operator.k8sUserPrefix" . }}"
             - name: OPERATOR_SERVICE_ACCOUNT_NAME
