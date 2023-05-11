@@ -64,6 +64,11 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     settings.admission.server = kopf.WebhookServer(host=OPERATOR_SERVICE_HOST, port=OPERATOR_SERVICE_PORT)
     settings.admission.managed = 'chaimeleon.eu'
 
+    # Fix: https://github.com/nolar/kopf/issues/585
+    settings.watching.client_timeout = 600
+    settings.watching.server_timeout = 600
+    settings.watching.connect_timeout = 60
+
     if not KEYCLOAK_CLIENT or not KEYCLOAK_CLIENT_SECRET or not DATASET_SERVICE_ENDPOINT or not KEYCLOAK_ENDPOINT or not KEYCLOAK_REALM or not OPERATOR_SERVICE_ACCOUNT_NAME or not OPERATOR_SERVICE_ACCOUNT_NAMESPACE:
         raise kopf.PermanentError("Some required variable is not set: KEYCLOAK_CLIENT, KEYCLOAK_CLIENT_SECRET, DATASET_SERVICE_ENDPOINT, KEYCLOAK_ENDPOINT, KEYCLOAK_REALM, OPERATOR_SERVICE_ACCOUNT_NAME, OPERATOR_SERVICE_ACCOUNT_NAMESPACE")
     
