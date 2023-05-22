@@ -3,7 +3,7 @@ ARG kopf_version='1.36.0'
 
 #RUN apt-get update && apt-get install -y python3 python3-pip
 RUN pip --no-cache-dir install kopf==${kopf_version}
-RUN pip --no-cache-dir install pykube-ng requests pyyaml kubernetes certbuilder
+RUN pip --no-cache-dir install pykube-ng requests kubernetes certbuilder guacli
 
 #RUN apt-get update && apt-get install -y --no-install-recommends ntp
 ADD chaimeleon-operator.py /chaimeleon-operator/chaimeleon-operator.py

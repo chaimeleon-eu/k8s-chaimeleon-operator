@@ -1,12 +1,16 @@
 import kopf
 import kubernetes
-import yaml
+import base64
 import os 
 import json
 import requests
 import time
+import guacli.guacamoleClient as guac
+import http.client
+import urllib.parse
+from datetime import datetime
 
-__VERSION__ = "2.0.0"
+__VERSION__ = "2.1.0"
 
 OPERATOR_SERVICE_ACCOUNT_NAME = None
 OPERATOR_SERVICE_ACCOUNT_NAMESPACE = None
@@ -25,6 +29,14 @@ DEFAULT_DATASET_SERVICE_MAX_RETRIES = 10
 K8S_USER_PREFIX=""
 SYSTEM_SERVICE_ACCOUNTS = []
 
+GUACAMOLE_URL = None
+GUACAMOLE_USER = None
+GUACAMOLE_PASSWORD = None
+GUACAMOLE_CONNECTIONS_BACKEND_HOST = 'guacamole-guacd.guacamole.svc.cluster.local'
+GUACAMOLE_CONNECTIONS_VNC_PORT = '5900'
+GUACAMOLE_CONNECTIONS_SFTP_USERNAME = 'chaimeleon'
+GUACAMOLE_CONNECTIONS_SFTP_PORT = '2222'
+
 @kopf.on.login(retries=3)
 def login_fn(**kwargs):
     # Login using the service account that is mounted automatically in the container
@@ -35,6 +47,8 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     global KEYCLOAK_CLIENT, KEYCLOAK_CLIENT_SECRET, KEYCLOAK_ENDPOINT, KEYCLOAK_REALM, DATASET_SERVICE_ENDPOINT, DATASET_SERVICE_TEST_ENDPOINT
     global DEFAULT_KEYCLOAK_MAX_RETRIES, KEYCLOAK_MAX_RETRIES, DEFAULT_DATASET_SERVICE_MAX_RETRIES, DATASET_SERVICE_MAX_RETRIES
     global K8S_USER_PREFIX, OPERATOR_SERVICE_ACCOUNT_NAMESPACE, OPERATOR_SERVICE_ACCOUNT_NAME, SYSTEM_SERVICE_ACCOUNTS
+    global GUACAMOLE_URL, GUACAMOLE_USER, GUACAMOLE_PASSWORD, GUACAMOLE_CONNECTIONS_BACKEND_HOST
+    global GUACAMOLE_CONNECTIONS_VNC_PORT, GUACAMOLE_CONNECTIONS_SFTP_USERNAME, GUACAMOLE_CONNECTIONS_SFTP_PORT
 
     # Required ENV vars
     KEYCLOAK_CLIENT = os.getenv('KEYCLOAK_CLIENT')
@@ -54,6 +68,14 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     K8S_USER_PREFIX = str(os.getenv('K8S_USER_PREFIX'))
     DATASET_SERVICE_TEST_ENDPOINT = os.getenv('DATASET_SERVICE_TEST_ENDPOINT')
     if DATASET_SERVICE_TEST_ENDPOINT == "": DATASET_SERVICE_TEST_ENDPOINT = None
+
+    GUACAMOLE_URL = os.environ.get('GUACAMOLE_URL', GUACAMOLE_URL)
+    GUACAMOLE_USER = os.environ.get('GUACAMOLE_USER', GUACAMOLE_USER)
+    GUACAMOLE_PASSWORD = os.environ.get('GUACAMOLE_PASSWORD', GUACAMOLE_PASSWORD)
+    GUACAMOLE_CONNECTIONS_BACKEND_HOST = os.environ.get('GUACAMOLE_CONNECTIONS_BACKEND_HOST', GUACAMOLE_CONNECTIONS_BACKEND_HOST)
+    GUACAMOLE_CONNECTIONS_VNC_PORT = os.environ.get('GUACAMOLE_CONNECTIONS_VNC_PORT', GUACAMOLE_CONNECTIONS_VNC_PORT)
+    GUACAMOLE_CONNECTIONS_SFTP_USERNAME = os.getenv('GUACAMOLE_CONNECTIONS_SFTP_USERNAME', GUACAMOLE_CONNECTIONS_SFTP_USERNAME)
+    GUACAMOLE_CONNECTIONS_SFTP_PORT = os.getenv('GUACAMOLE_CONNECTIONS_SFTP_PORT', GUACAMOLE_CONNECTIONS_SFTP_PORT)
 
     #logger.info("OPERATOR_SERVICE_HOST=%s" % (OPERATOR_SERVICE_HOST))
     #logger.info("OPERATOR_SERVICE_PORT=%s" % (OPERATOR_SERVICE_PORT))
@@ -97,6 +119,9 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     # The garbage collector sometimes mutates a deployment before delete
     SYSTEM_SERVICE_ACCOUNTS.append("system:serviceaccount:kube-system:generic-garbage-collector")
 
+ANNOTATION_CREATE_GUACAMOLE_CONNECTION = "chaimeleon.eu/createGuacamoleConnection"
+ANNOTATION_GUACAMOLE_CONNECTION_NAME = "chaimeleon.eu/guacamoleConnectionName"
+
 DATASET_ACCESS_ANNOTATIONS = {'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT}
 
 # The 'id' is required when multiple decorators on the same function.
@@ -104,12 +129,12 @@ DATASET_ACCESS_ANNOTATIONS = {'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaime
 
 @kopf.on.mutate('apps/v1', 'deployments', id='mutate_deployment_fn', param='deployment', annotations=DATASET_ACCESS_ANNOTATIONS)
 @kopf.on.mutate('batch/v1', 'jobs', id='mutate_job_fn', param='job', annotations=DATASET_ACCESS_ANNOTATIONS)
-def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, annotations, **_):
+def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, name, annotations, **_):
     # Skip the modifications performed by system service accounts
     if (userinfo['username'] in SYSTEM_SERVICE_ACCOUNTS): return
 
     logger.debug("############# EVENT for prepare "+param)
-    prepare_deployment_or_job_for_dataset_access(spec, patch, logger, userinfo, annotations)
+    prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch, logger, userinfo)
 
 # @kopf.on.validate('apps/v1', 'deployments', id='validate_create_deployment_fn', annotations=DATASET_ACCESS_ANNOTATIONS, operation='CREATE')
 # @kopf.on.validate('batch/v1', 'jobs', id='validate_create_job_fn', annotations=DATASET_ACCESS_ANNOTATIONS, operation='CREATE')
@@ -125,6 +150,10 @@ def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, annot
 @kopf.on.create('batch/v1', 'jobs', id='create_job_fn', param='job', annotations=DATASET_ACCESS_ANNOTATIONS)
 def create_deployment_or_job_fn(param, spec, name, namespace, logger, body, uid, annotations, **kwargs):
     logger.debug("############# EVENT for notify the start of dataset access by a "+ param)
+    # logger.debug("############# BODY: "+ json.dumps(dict(body)))
+    #if bool(annotations["chaimeleon.eu/testingEnvironment"]):
+    if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true':
+        create_guacamole_connection(name, namespace, spec, annotations, logger)
     notify_dataset_access(spec, name, namespace, logger, body, uid, annotations)
 
 # @kopf.on.update('apps/v1', 'deployments', annotations=DATASET_ACCESS_ANNOTATIONS)
@@ -136,13 +165,86 @@ def create_deployment_or_job_fn(param, spec, name, namespace, logger, body, uid,
 def delete_deployment_or_job_fn(param, spec, name, namespace, logger, body, uid, annotations, **kwargs):
     logger.debug("############# EVENT for notify the end of dataset access by a " + param)
     notify_end_of_dataset_access(spec, name, namespace, logger, body, uid, annotations)
+    if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true':
+        delete_guacamole_connection(name, annotations, logger)
+
+# @kopf.on.create('v1', 'services', annotations={ANNOTATION_CREATE_GUACAMOLE_CONNECTION: kopf.PRESENT})
+# def create_service_fn(spec, name, namespace, logger, body, uid, annotations, **kwargs):
+#     create_guacamole_connection(name, namespace, spec, annotations, logger)
+
+# @kopf.on.delete('v1', 'services', annotations={ANNOTATION_CREATE_GUACAMOLE_CONNECTION: kopf.PRESENT})
+# def delete_service_fn(spec, name, namespace, logger, body, uid, annotations, **kwargs):
+#     #delete_guacamole_connection()
 
 # @kopf.on.event('apps/v1', 'deployments')
 # def my_handler(event, logger, **_):
 #     logger.debug("############# SOME DEPLOYMENT event.")
 
 
-def prepare_deployment_or_job_for_dataset_access(spec, patch, logger, userinfo, annotations):
+def get_guacamole_client(url):
+    urlp = urllib.parse.urlparse(url)
+    if urlp.hostname is None: raise Exception('Wrong url.')
+    port = urlp.port
+    if urlp.scheme == 'http':
+        if port == None: port = 80
+        connection = http.client.HTTPConnection(urlp.hostname, port) 
+    else:
+        if port == None: port = 443
+        connection = http.client.HTTPSConnection(urlp.hostname, port)
+    return guac.GuacamoleClient(connection, urlp.path)
+
+def get_container_password_from_secret(secret_name, namespace):
+    #kubernetes.config.load_kube_config()
+    kubernetes.config.load_incluster_config()
+    api = kubernetes.client.CoreV1Api()
+    secret = api.read_namespaced_secret(secret_name, namespace)
+    password = secret.data["container-password"]
+    decoded = base64.b64decode(password).decode('utf-8')
+    return decoded
+
+def create_guacamole_connection(name, namespace, spec, annotations, logger):
+    if GUACAMOLE_URL is None: return   # Guacamole connection creation is disabled
+    client = get_guacamole_client(GUACAMOLE_URL)
+    logger.debug('Connecting to '+GUACAMOLE_URL+ 'api/')
+    client.login(GUACAMOLE_USER, GUACAMOLE_PASSWORD)
+    logger.debug('Login success.')
+
+    username = annotations["chaimeleon.eu/username"]
+    connectionGroupId = client.getConnectionGroupId(username)
+    if connectionGroupId is None: logger.warning('Connection group "'+username+'" not found.'); return
+
+    connectionName = annotations[ANNOTATION_GUACAMOLE_CONNECTION_NAME]
+    vnc_host = f"{name}.{namespace}.svc.cluster.local"   # A k8s service with the same name should be created in the same namespace
+    vnc_port = GUACAMOLE_CONNECTIONS_VNC_PORT
+    vnc_password = get_container_password_from_secret(name, namespace)
+    logger.debug("############# SECRET content: "+ vnc_password)
+    sftp_port = GUACAMOLE_CONNECTIONS_SFTP_PORT
+    sftp_user = GUACAMOLE_CONNECTIONS_SFTP_USERNAME
+    sftp_password = vnc_password
+    logger.debug('Creating VNC connection for '+vnc_host+':'+vnc_port)
+    connectionId = client.createVncConnection(connectionName, connectionGroupId, GUACAMOLE_CONNECTIONS_BACKEND_HOST, 
+                                            vnc_host, vnc_port, vnc_password, sftp_user, sftp_password, sftp_port, 
+                                            sftp_disable_download=True, sftp_disable_upload=False,
+                                            disable_clipboard_copy=True, disable_clipboard_paste=False)
+    client.changeUserAccessToConnection(username, guac.PermissionsOperation.ADD, connectionId)
+
+def delete_guacamole_connection(name, annotations, logger):
+    if GUACAMOLE_URL is None: return   # Guacamole connection creation is disabled
+    client = get_guacamole_client(GUACAMOLE_URL)
+    logger.debug('Connecting to '+GUACAMOLE_URL+ 'api/')
+    client.login(GUACAMOLE_USER, GUACAMOLE_PASSWORD)
+    logger.debug('Login success.')
+
+    username = annotations["chaimeleon.eu/username"]
+    connectionGroupId = client.getConnectionGroupId(username)
+    if connectionGroupId is None: logger.warning('Connection group "'+username+'" not found.'); return
+
+    connectionName = annotations[ANNOTATION_GUACAMOLE_CONNECTION_NAME]
+    connectionId = client.getConnectionId(connectionName, connectionGroupId)
+    logger.debug(f'Deleting guacamole connection {connectionId}: {connectionName}')
+    client.deleteConnection(connectionId)
+
+def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch, logger, userinfo):
     logger.debug("############# prev securityContext (SPEC): " + json.dumps(spec['template']['spec']['securityContext']))
     securityContext = {'runAsUser': 1000, 'runAsGroup': 1000, 'fsGroup': 1000}
     logger.debug("############# Adding securityContext: " + json.dumps(dict(securityContext)))
@@ -192,7 +294,11 @@ def prepare_deployment_or_job_for_dataset_access(spec, patch, logger, userinfo, 
                 raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
 
     # Store some info required later
-    newAnnotations = {"chaimeleon.eu/username": username, "chaimeleon.eu/testingEnvironment": str(testingEnvironment)}
+    newAnnotations = {}
+    newAnnotations["chaimeleon.eu/username"] = username
+    newAnnotations["chaimeleon.eu/testingEnvironment"] = str(testingEnvironment)
+    if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true':
+        newAnnotations[ANNOTATION_GUACAMOLE_CONNECTION_NAME] = datetime.today().strftime('%Y-%m-%d-%H-%M-%S') + "---" + name
     logger.debug("############# Adding annotations: " + json.dumps(dict(newAnnotations)))
     patch.metadata['annotations'] = newAnnotations
 

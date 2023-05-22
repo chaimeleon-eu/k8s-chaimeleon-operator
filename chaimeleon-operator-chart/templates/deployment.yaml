@@ -52,7 +52,17 @@ spec:
             - name: OPERATOR_SERVICE_ACCOUNT_NAME
               value: {{ include "chaimeleon-operator.serviceAccountName" . }}
             - name: OPERATOR_SERVICE_ACCOUNT_NAMESPACE
-              value: {{ .Release.Namespace }}      
+              value: {{ .Release.Namespace }}   
+            - name: GUACAMOLE_URL
+              value: "{{ .Values.operatorConfiguration.guacamoleURL }}"
+            - name: GUACAMOLE_USER
+              value: "{{ .Values.operatorConfiguration.guacamoleUser }}"
+            - name: GUACAMOLE_PASSWORD
+              value: "{{ .Values.operatorConfiguration.guacamolePassword }}"
+            - name: GUACAMOLE_CONNECTIONS_BACKEND_HOST
+              value: "{{ .Values.operatorConfiguration.guacamoleConnectionsBackendHost }}"
+            
+              
           ports:
             - name: https
               containerPort: {{ .Values.service.port }}

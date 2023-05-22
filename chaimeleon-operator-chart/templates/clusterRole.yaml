@@ -21,6 +21,9 @@ rules:
   - apiGroups: ["*"]
     resources: ["deployments", "deployments/status", "jobs", "jobs/status"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["*"]
+    resources: ["secrets"]
+    verbs: ["get"]
 
   # - apiGroups: [""]
   #   resources: [events]
