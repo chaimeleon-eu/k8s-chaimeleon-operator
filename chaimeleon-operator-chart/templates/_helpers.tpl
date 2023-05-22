@@ -76,14 +76,14 @@ Create the name of the ClusterRole
 Create the name of the roleBinding
 */}}
 {{- define "chaimeleon-operator.roleBindingName" -}}
-{{- default "chaimeleon-operator-roleBinding" .Values.rbac.roleBinding.name -}}
+{{- default "chaimeleon-operator-rolebinding-namespaced" .Values.rbac.roleBinding.name -}}
 {{- end }}
 
 {{/*
 Create the name of the ClusterRoleBinding
 */}}
 {{- define "chaimeleon-operator.clusterRoleBindingName" -}}
-{{- default "chaimeleon-operator-clusterRoleBinding" .Values.rbac.clusterRoleBinding.name -}}
+{{- default "chaimeleon-operator-rolebinding-cluster" .Values.rbac.clusterRoleBinding.name -}}
 {{- end }}
 
 {{/*
