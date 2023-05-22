@@ -63,7 +63,7 @@ def config(settings: kopf.OperatorSettings, logger, **_):
 
     settings.admission.server = kopf.WebhookServer(host=OPERATOR_SERVICE_HOST, port=int(OPERATOR_SERVICE_PORT))
     settings.admission.managed = 'chaimeleon.eu'
-    
+
     # Fix: https://github.com/nolar/kopf/issues/585
     settings.watching.client_timeout = 600
     settings.watching.server_timeout = 600
@@ -99,11 +99,12 @@ def config(settings: kopf.OperatorSettings, logger, **_):
 
 DATASET_ACCESS_ANNOTATIONS = {'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT}
 
+# The 'id' is required when multiple decorators on the same function.
+# The 'param' is useful for identifying which decorator has been triggered.
 
 @kopf.on.mutate('apps/v1', 'deployments', id='mutate_deployment_fn', param='deployment', annotations=DATASET_ACCESS_ANNOTATIONS)
 @kopf.on.mutate('batch/v1', 'jobs', id='mutate_job_fn', param='job', annotations=DATASET_ACCESS_ANNOTATIONS)
 def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, annotations, **_):
-    global SYSTEM_SERVICE_ACCOUNTS
     # Skip the modifications performed by system service accounts
     if (userinfo['username'] in SYSTEM_SERVICE_ACCOUNTS): return
 
@@ -115,10 +116,9 @@ def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, annot
 # @kopf.on.validate('apps/v1', 'deployments', id='validate_update_deployment_fn', annotations=DATASET_ACCESS_ANNOTATIONS, operation='UPDATE')
 # @kopf.on.validate('batch/v1', 'jobs', id='validate_update_job_fn', annotations=DATASET_ACCESS_ANNOTATIONS, operation='UPDATE')
 # def validate_deployment_or_job_fn(spec, logger, userinfo, body, warnings, headers, uid, annotations, **kwargs):
-#     global OPERATOR_SERVICE_ACCOUNT_NAMESPACE, OPERATOR_SERVICE_ACCOUNT_NAME, SYSTEM_SERVICE_ACCOUNTS
 #     # Skip the modifications performed by system service accounts
 #     if (userinfo['username'] in SYSTEM_SERVICE_ACCOUNTS): return
-
+#
 #     validate_dataset_access(spec, logger, userinfo, body, warnings, headers, uid, annotations)
 
 @kopf.on.create('apps/v1', 'deployments', id='create_deployment_fn', param='deployment', annotations=DATASET_ACCESS_ANNOTATIONS)
@@ -143,7 +143,6 @@ def delete_deployment_or_job_fn(param, spec, name, namespace, logger, body, uid,
 
 
 def prepare_deployment_or_job_for_dataset_access(spec, patch, logger, userinfo, annotations):
-    global K8S_USER_PREFIX, DATASET_SERVICE_ENDPOINT, DATASET_SERVICE_TEST_ENDPOINT
     logger.debug("############# prev securityContext (SPEC): " + json.dumps(spec['template']['spec']['securityContext']))
     securityContext = {'runAsUser': 1000, 'runAsGroup': 1000, 'fsGroup': 1000}
     logger.debug("############# Adding securityContext: " + json.dumps(dict(securityContext)))
@@ -200,7 +199,6 @@ def prepare_deployment_or_job_for_dataset_access(spec, patch, logger, userinfo, 
     logger.debug(f"Mutation ended successfully")
 
 # def validate_dataset_access(spec, logger, userinfo, body, warnings, headers, uid, annotations):
-#     global K8S_USER_PREFIX, DATASET_SERVICE_ENDPOINT, DATASET_SERVICE_TEST_ENDPOINT
 #     _spec = dict(spec)
     
 #     if "securityContext" not in _spec["template"]["spec"]:
@@ -277,8 +275,8 @@ def notify_dataset_access(spec, name, namespace, logger, body, uid, annotations)
 def notify_end_of_dataset_access(spec, name, namespace, logger, body, uid, annotations):
     logger.debug("############# ANNOTATIONS: " + json.dumps(dict(annotations)))
     datasets =           annotations["chaimeleon.eu/datasetsIDs"].replace(" ", "").split(",")
-    username =           annotations["chaimeleon.eu/username"]
-    testingEnvironment = bool(annotations["chaimeleon.eu/testingEnvironment"])
+    username =           annotations["chaimeleon.eu/username"] if "chaimeleon.eu/username" in annotations else "unknown"
+    testingEnvironment = bool(annotations["chaimeleon.eu/testingEnvironment"]) if "chaimeleon.eu/testingEnvironment" in annotations else False
     toolName =           annotations["chaimeleon.eu/toolName"].replace(" ", "")
     toolVersion =        annotations["chaimeleon.eu/toolVersion"].replace(" ", "")
     access_token = get_access_token(logger)
@@ -289,23 +287,18 @@ def notify_end_of_dataset_access(spec, name, namespace, logger, body, uid, annot
     else: logger.error( log_text )
 
 def get_access_token(logger):
-    global KEYCLOAK_CLIENT, KEYCLOAK_CLIENT_SECRET, KEYCLOAK_ENDPOINT, KEYCLOAK_REALM, KEYCLOAK_MAX_RETRIES
-    access_token = None
-
     URL = f"{KEYCLOAK_ENDPOINT}/auth/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token"
     data = {"client_id": KEYCLOAK_CLIENT, "client_secret": KEYCLOAK_CLIENT_SECRET, "grant_type": "client_credentials"}
     response = do_request(URL, "POST", logger, KEYCLOAK_MAX_RETRIES, data=data, verify=True)
 
     if response is None: return None
     if response.status_code == 200:
-        access_token = response.json()['access_token']
-    if not access_token:
+        return response.json()['access_token']
+    else:
         logger.error(f"Cannot obtain the access_token for client {KEYCLOAK_CLIENT}. Response: status_code={response.status_code}, text={response.text}")
-    return access_token
+        return None
 
 def check_access_dataset(logger, access_token, username, datasets_list, dataset_service_endpoint):
-    global DATASET_SERVICE_MAX_RETRIES
-
     result = { 'granted': [], 'denied': [] }
     URL = f"{dataset_service_endpoint}/api/datasetAccessCheck"
     data = { "userName": username, "datasets": datasets_list }
@@ -332,8 +325,6 @@ def check_access_dataset(logger, access_token, username, datasets_list, dataset_
     return result
 
 def get_user_gid(logger, access_token, username):
-    global DATASET_SERVICE_ENDPOINT, DATASET_SERVICE_MAX_RETRIES
-
     URL = f"{DATASET_SERVICE_ENDPOINT}/api/users/{username}"
     headers = { "Content-Type": "application/json", "Accept": "application/json", "Authorization": "bearer " + access_token }
     response =  do_request(URL, "GET", logger, DATASET_SERVICE_MAX_RETRIES, headers=headers, verify=False)
@@ -348,8 +339,6 @@ def get_user_gid(logger, access_token, username):
         return None
 
 def put_user_gid_in_test_dataset_service(logger, access_token, username, user_gid):
-    global DATASET_SERVICE_TEST_ENDPOINT, DATASET_SERVICE_MAX_RETRIES
-
     URL = f"{DATASET_SERVICE_TEST_ENDPOINT}/api/users/{username}"
     headers = { "Content-Type": "application/json", "Accept": "application/json", "Authorization": "bearer " + access_token }
     data = { "groups": [], "gid": user_gid }
@@ -363,9 +352,6 @@ def put_user_gid_in_test_dataset_service(logger, access_token, username, user_gi
         logger.error(f"Error at --put_user_gid_in_test_dataset_service-- function: ({response.status_code}) {response.text}")
 
 def access_dataset(logger, access_token, id, username, datasets_list, toolName, toolVersion, testingDatalake):
-    global DATASET_SERVICE_ENDPOINT, DATASET_SERVICE_TEST_ENDPOINT, DATASET_SERVICE_MAX_RETRIES
-
-    result = False
     endpoint = DATASET_SERVICE_TEST_ENDPOINT if testingDatalake else DATASET_SERVICE_ENDPOINT
     URL = f"{endpoint}/api/datasetAccess/{id}"
     data = { "userName": username, "datasets": datasets_list, "toolName": toolName, "toolVersion": toolVersion }
@@ -374,16 +360,13 @@ def access_dataset(logger, access_token, id, username, datasets_list, toolName, 
     response =  do_request(URL, "POST", logger, DATASET_SERVICE_MAX_RETRIES, headers=headers, data=json.dumps(data), verify=False)
 
     if response.status_code == 201:
-        result = True
+        return True
     else:
         if response.status_code == 401:
-            logger.error("Invalid access token used at --access_dataset-- function: " + response.text)
-         
-    return result
+            logger.error("Invalid access token used at --access_dataset-- function: " + response.text) 
+        return False
 
 def finalise_access_dataset(logger, access_token, id, testingDatalake):
-    global DATASET_SERVICE_ENDPOINT, DATASET_SERVICE_TEST_ENDPOINT, DATASET_SERVICE_MAX_RETRIES
-
     endpoint = DATASET_SERVICE_TEST_ENDPOINT if testingDatalake else DATASET_SERVICE_ENDPOINT
     URL = f"{endpoint}/api/datasetAccess/{id}"
     headers= { "Content-Type": "application/json", "Accept": "application/json", "Authorization": "bearer " + access_token }
@@ -401,19 +384,15 @@ def finalise_access_dataset(logger, access_token, id, testingDatalake):
         return False
 
 def do_request(URL, method, logger, max_retries, data=None, headers=None, verify=True):
-    r = None
-    ok = False
     current_retries = 0
-    while (current_retries < max_retries) and (not ok) :
+    while (current_retries < max_retries) :
         current_retries += 1
         try: 
-            r =  requests.request(method, URL, data=data, verify=verify, headers=headers)
-            ok = True
+            return requests.request(method, URL, data=data, verify=verify, headers=headers)
         except requests.exceptions.ConnectionError:
             logger.warning(f"Cannot connect to {URL}, waiting 1 seconds...")
             time.sleep(1)
         except Exception as e:
             logger.warning("Unexpected exception " + str(e) )
-    if not ok:
-        logger.error(f"Cannot connect to {URL} (retries = {max_retries})")
-    return r
+    logger.error(f"Cannot connect to {URL} (retries = {max_retries})")
+    return None
