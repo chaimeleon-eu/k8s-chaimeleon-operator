@@ -119,10 +119,16 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     # The garbage collector sometimes mutates a deployment before delete
     SYSTEM_SERVICE_ACCOUNTS.append("system:serviceaccount:kube-system:generic-garbage-collector")
 
+ANNOTATION_DATASETS_IDS = "chaimeleon.eu/datasetsIDs"
+ANNOTATION_TOOL_NAME = "chaimeleon.eu/toolName"
+ANNOTATION_TOOL_VERSION = "chaimeleon.eu/toolVersion"
+ANNOTATION_USERNAME = "chaimeleon.eu/username"
 ANNOTATION_CREATE_GUACAMOLE_CONNECTION = "chaimeleon.eu/createGuacamoleConnection"
 ANNOTATION_GUACAMOLE_CONNECTION_NAME = "chaimeleon.eu/guacamoleConnectionName"
+ANNOTATION_JOB_RESOURCES_FLAVOR = "chaimeleon.eu/jobResourcesFlavor"
+ANNOTATION_TESTING_ENVIRONMENT = "chaimeleon.eu/testingEnvironment"
 
-DATASET_ACCESS_ANNOTATIONS = {'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaimeleon.eu/toolName': kopf.PRESENT, 'chaimeleon.eu/toolVersion': kopf.PRESENT}
+DATASET_ACCESS_ANNOTATIONS = {ANNOTATION_DATASETS_IDS: kopf.PRESENT, ANNOTATION_TOOL_NAME: kopf.PRESENT, ANNOTATION_TOOL_VERSION: kopf.PRESENT}
 
 # The 'id' is required when multiple decorators on the same function.
 # The 'param' is useful for identifying which decorator has been triggered.
@@ -132,9 +138,11 @@ DATASET_ACCESS_ANNOTATIONS = {'chaimeleon.eu/datasetsIDs': kopf.PRESENT, 'chaime
 def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, name, annotations, **_):
     # Skip the modifications performed by system service accounts
     if (userinfo['username'] in SYSTEM_SERVICE_ACCOUNTS): return
-
+    
     logger.debug("############# EVENT for prepare "+param)
     prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch, logger, userinfo)
+    logger.debug(f"Mutation ended successfully")
+
 
 # @kopf.on.validate('apps/v1', 'deployments', id='validate_create_deployment_fn', annotations=DATASET_ACCESS_ANNOTATIONS, operation='CREATE')
 # @kopf.on.validate('batch/v1', 'jobs', id='validate_create_job_fn', annotations=DATASET_ACCESS_ANNOTATIONS, operation='CREATE')
@@ -151,7 +159,7 @@ def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, name,
 def create_deployment_or_job_fn(param, spec, name, namespace, logger, body, uid, annotations, **kwargs):
     logger.debug("############# EVENT for notify the start of dataset access by a "+ param)
     # logger.debug("############# BODY: "+ json.dumps(dict(body)))
-    #if bool(annotations["chaimeleon.eu/testingEnvironment"]):
+    #if bool(annotations[ANNOTATION_TESTING_ENVIRONMENT]):
     if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true':
         create_guacamole_connection(name, namespace, spec, annotations, logger)
     notify_dataset_access(spec, name, namespace, logger, body, uid, annotations)
@@ -209,7 +217,7 @@ def create_guacamole_connection(name, namespace, spec, annotations, logger):
     client.login(GUACAMOLE_USER, GUACAMOLE_PASSWORD)
     logger.debug('Login success.')
 
-    username = annotations["chaimeleon.eu/username"]
+    username = annotations[ANNOTATION_USERNAME]
     connectionGroupId = client.getConnectionGroupId(username)
     if connectionGroupId is None: logger.warning('Connection group "'+username+'" not found.'); return
 
@@ -235,12 +243,14 @@ def delete_guacamole_connection(name, annotations, logger):
     client.login(GUACAMOLE_USER, GUACAMOLE_PASSWORD)
     logger.debug('Login success.')
 
-    username = annotations["chaimeleon.eu/username"]
+    username = annotations[ANNOTATION_USERNAME]
     connectionGroupId = client.getConnectionGroupId(username)
     if connectionGroupId is None: logger.warning('Connection group "'+username+'" not found.'); return
 
     connectionName = annotations[ANNOTATION_GUACAMOLE_CONNECTION_NAME]
     connectionId = client.getConnectionId(connectionName, connectionGroupId)
+    if connectionId is None: logger.warning(f'Guacamole connection {connectionName} not found in the {username} connections group'); return
+    
     logger.debug(f'Deleting guacamole connection {connectionId}: {connectionName}')
     client.deleteConnection(connectionId)
 
@@ -250,10 +260,10 @@ def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch,
     logger.debug("############# Adding securityContext: " + json.dumps(dict(securityContext)))
     patch.spec['template'] = {'spec': {'securityContext': securityContext}}
 
-    datasets = annotations["chaimeleon.eu/datasetsIDs"].replace(" ", "").split(",")
-    toolName = annotations["chaimeleon.eu/toolName"].replace(" ", "")
+    datasets = annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
+    toolName = annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
     if not isinstance(datasets, list):
-        raise kopf.AdmissionError("The annotation 'chaimeleon.eu/datasetsIDs' must be a list of datasetsIDs sepparated with ','")
+        raise kopf.AdmissionError(f"The annotation '{ANNOTATION_DATASETS_IDS}' must be a list of datasetsIDs sepparated with ','")
     username = userinfo['username'][ len(K8S_USER_PREFIX): ]    # Remove Kubernetes prefix for username
     testingEnvironment = False
     if len(datasets) == 0:
@@ -283,26 +293,22 @@ def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch,
                     testingEnvironment = True
                     logger.debug("############# Changing paths of volumes (datalake and datasets) for testing environment")
                     patch.spec['template']['spec']['volumes'] = spec['template']['spec']['volumes']
-                    #iVol = 0
                     for vol in patch.spec['template']['spec']['volumes']:
                         if vol['name'] == 'datalake':
                             vol['cephfs']['path'] = "/datalake-test"
                         if str(vol['cephfs']['path']).startswith('/datasets/'):
                             vol['cephfs']['path'] = "/datasets-test/"+vol['name']
-                        #iVol += 1
             else:
                 raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
 
     # Store some info required later
     newAnnotations = {}
-    newAnnotations["chaimeleon.eu/username"] = username
-    newAnnotations["chaimeleon.eu/testingEnvironment"] = str(testingEnvironment)
+    newAnnotations[ANNOTATION_USERNAME] = username
+    newAnnotations[ANNOTATION_TESTING_ENVIRONMENT] = str(testingEnvironment)
     if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true':
         newAnnotations[ANNOTATION_GUACAMOLE_CONNECTION_NAME] = datetime.today().strftime('%Y-%m-%d-%H-%M-%S') + "---" + name
     logger.debug("############# Adding annotations: " + json.dumps(dict(newAnnotations)))
     patch.metadata['annotations'] = newAnnotations
-
-    logger.debug(f"Mutation ended successfully")
 
 # def validate_dataset_access(spec, logger, userinfo, body, warnings, headers, uid, annotations):
 #     _spec = dict(spec)
@@ -318,16 +324,16 @@ def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch,
 #         raise kopf.AdmissionError("The property spec.securityContext.supplementalGroups must be a list with one element.")
 
 #     gid = supplementalGroups[0]
-#     datasets = annotations["chaimeleon.eu/datasetsIDs"].replace(" ", "").split(",")
+#     datasets = annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
 #     # testingDatalake = ("chaimeleon.eu/testingDatalake" in annotations 
 #     #                    and str(annotations["chaimeleon.eu/testingDatalake"]).strip().lower() == 'true')
-#     toolName = annotations["chaimeleon.eu/toolName"].replace(" ", "")
-#     toolVersion = annotations["chaimeleon.eu/toolVersion"].replace(" ", "")
+#     toolName = annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
+#     toolVersion = annotations[ANNOTATION_TOOL_VERSION].replace(" ", "")
 
 #     keycloak_username = userinfo['username'][ len(K8S_USER_PREFIX): ]    # Remove Kubernetes prefix for username
 
 #     if not isinstance(datasets, list):
-#         raise kopf.AdmissionError("The annotation 'chaimeleon.eu/datasetsIDs' must be a list of datasetsIDs sepparated with ','")
+#         raise kopf.AdmissionError(f"The annotation '{ANNOTATION_DATASETS_IDS}' must be a list of datasetsIDs sepparated with ','")
 
 #     logger.debug("Starting validation uid={} -> username={}, toolName={}, toolVersion={}, providedGID={}, datasets={}" 
 #                  .format(uid, keycloak_username, toolName, toolVersion, str(gid), str(datasets)))  #, ", testingDatalake = true" if testingDatalake else ""))
@@ -366,11 +372,11 @@ def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch,
 
 def notify_dataset_access(spec, name, namespace, logger, body, uid, annotations):
     logger.debug("############# ANNOTATIONS: " + json.dumps(dict(annotations)))
-    datasets =           annotations["chaimeleon.eu/datasetsIDs"].replace(" ", "").split(",")
-    username =           annotations["chaimeleon.eu/username"]
-    testingEnvironment = bool(annotations["chaimeleon.eu/testingEnvironment"])
-    toolName =           annotations["chaimeleon.eu/toolName"].replace(" ", "")
-    toolVersion =        annotations["chaimeleon.eu/toolVersion"].replace(" ", "")
+    datasets =           annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
+    username =           annotations[ANNOTATION_USERNAME]
+    testingEnvironment = bool(annotations[ANNOTATION_TESTING_ENVIRONMENT])
+    toolName =           annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
+    toolVersion =        annotations[ANNOTATION_TOOL_VERSION].replace(" ", "")
     access_token = get_access_token(logger)
     ok = access_dataset(logger, access_token, uid, username, datasets, toolName, toolVersion, testingEnvironment)
     log_text = ("uid={} -> Access dataset {}successfully notified: User={}, tool={}:{} , datasets={}{}"
@@ -380,11 +386,11 @@ def notify_dataset_access(spec, name, namespace, logger, body, uid, annotations)
     
 def notify_end_of_dataset_access(spec, name, namespace, logger, body, uid, annotations):
     logger.debug("############# ANNOTATIONS: " + json.dumps(dict(annotations)))
-    datasets =           annotations["chaimeleon.eu/datasetsIDs"].replace(" ", "").split(",")
-    username =           annotations["chaimeleon.eu/username"] if "chaimeleon.eu/username" in annotations else "unknown"
-    testingEnvironment = bool(annotations["chaimeleon.eu/testingEnvironment"]) if "chaimeleon.eu/testingEnvironment" in annotations else False
-    toolName =           annotations["chaimeleon.eu/toolName"].replace(" ", "")
-    toolVersion =        annotations["chaimeleon.eu/toolVersion"].replace(" ", "")
+    datasets =           annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
+    username =           annotations[ANNOTATION_USERNAME] if ANNOTATION_USERNAME in annotations else "unknown"
+    testingEnvironment = bool(annotations[ANNOTATION_TESTING_ENVIRONMENT]) if ANNOTATION_TESTING_ENVIRONMENT in annotations else False
+    toolName =           annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
+    toolVersion =        annotations[ANNOTATION_TOOL_VERSION].replace(" ", "")
     access_token = get_access_token(logger)
     ok = finalise_access_dataset(logger, access_token, uid, testingEnvironment)
     log_text = ("uid={} -> End of dataset access {}successfully notified: User={}, tool={}:{} , datasets:{}{}"
