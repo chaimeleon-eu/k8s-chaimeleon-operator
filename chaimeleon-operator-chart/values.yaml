@@ -3,6 +3,7 @@
 # Declare variables to be passed into your templates.
 
 priorityClassName: ""
+nodeSelector: {}
 
 serviceAccount:
   # Annotations to add to the service account
