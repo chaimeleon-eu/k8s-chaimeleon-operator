@@ -135,12 +135,17 @@ DATASET_ACCESS_ANNOTATIONS = {ANNOTATION_DATASETS_IDS: kopf.PRESENT, ANNOTATION_
 
 @kopf.on.mutate('apps/v1', 'deployments', id='mutate_deployment_fn', param='deployment', annotations=DATASET_ACCESS_ANNOTATIONS)
 @kopf.on.mutate('batch/v1', 'jobs', id='mutate_job_fn', param='job', annotations=DATASET_ACCESS_ANNOTATIONS)
-def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, name, annotations, **_):
+def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, name, namespace, annotations, **_):
     # Skip the modifications performed by system service accounts
-    if (userinfo['username'] in SYSTEM_SERVICE_ACCOUNTS): return
+    if userinfo['username'] in SYSTEM_SERVICE_ACCOUNTS: return
+    # We only have to manage deployments and jobs from normal users, and they only have permissions to deploy in their own namespaces
+    if not str(namespace).startswith("user-"): return
+    username = namespace[5:]
+    #username = userinfo['username'][ len(K8S_USER_PREFIX): ]    # Remove Kubernetes prefix for username
+    # userinfo is the k8s user, which can be an admin deploying or adjusting a deployment for the user
     
     logger.debug("############# EVENT for prepare "+param)
-    prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch, logger, userinfo)
+    prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch, logger, username)
     logger.debug(f"Mutation ended successfully")
 
 
@@ -150,7 +155,7 @@ def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, name,
 # @kopf.on.validate('batch/v1', 'jobs', id='validate_update_job_fn', annotations=DATASET_ACCESS_ANNOTATIONS, operation='UPDATE')
 # def validate_deployment_or_job_fn(spec, logger, userinfo, body, warnings, headers, uid, annotations, **kwargs):
 #     # Skip the modifications performed by system service accounts
-#     if (userinfo['username'] in SYSTEM_SERVICE_ACCOUNTS): return
+#     if userinfo['username'] in SYSTEM_SERVICE_ACCOUNTS: return
 #
 #     validate_dataset_access(spec, logger, userinfo, body, warnings, headers, uid, annotations)
 
@@ -254,7 +259,7 @@ def delete_guacamole_connection(name, annotations, logger):
     logger.debug(f'Deleting guacamole connection {connectionId}: {connectionName}')
     client.deleteConnection(connectionId)
 
-def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch, logger, userinfo):
+def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch, logger, username):
     logger.debug("############# prev securityContext (SPEC): " + json.dumps(spec['template']['spec']['securityContext']))
     securityContext = {'runAsUser': 1000, 'runAsGroup': 1000, 'fsGroup': 1000}
     logger.debug("############# Adding securityContext: " + json.dumps(dict(securityContext)))
@@ -264,7 +269,6 @@ def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch,
     toolName = annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
     if not isinstance(datasets, list):
         raise kopf.AdmissionError(f"The annotation '{ANNOTATION_DATASETS_IDS}' must be a list of datasetsIDs sepparated with ','")
-    username = userinfo['username'][ len(K8S_USER_PREFIX): ]    # Remove Kubernetes prefix for username
     testingEnvironment = False
     if len(datasets) == 0:
         logger.info(f"User {username} will deploy toolName={toolName} without datasets")
@@ -305,7 +309,8 @@ def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch,
     newAnnotations = {}
     newAnnotations[ANNOTATION_USERNAME] = username
     newAnnotations[ANNOTATION_TESTING_ENVIRONMENT] = str(testingEnvironment)
-    if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true':
+    if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true' \
+        and not ANNOTATION_GUACAMOLE_CONNECTION_NAME in annotations:
         newAnnotations[ANNOTATION_GUACAMOLE_CONNECTION_NAME] = datetime.today().strftime('%Y-%m-%d-%H-%M-%S') + "---" + name
     logger.debug("############# Adding annotations: " + json.dumps(dict(newAnnotations)))
     patch.metadata['annotations'] = newAnnotations
