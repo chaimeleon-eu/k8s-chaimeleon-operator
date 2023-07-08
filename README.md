@@ -4,7 +4,7 @@
 
 ```
 set IMAGE_NAME=harbor.chaimeleon-eu.i3m.upv.es/chaimeleon-services/k8s-operator
-set IMAGE_TAG=2.1.1-1.36.0-test
+set IMAGE_TAG=2.1.2-1.36.0
 
 docker build -t %IMAGE_NAME%:%IMAGE_TAG% .
 

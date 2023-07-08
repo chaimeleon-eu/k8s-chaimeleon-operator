@@ -164,7 +164,6 @@ def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, name,
 def create_deployment_or_job_fn(param, spec, name, namespace, logger, body, uid, annotations, **kwargs):
     logger.debug("############# EVENT for notify the start of dataset access by a "+ param)
     # logger.debug("############# BODY: "+ json.dumps(dict(body)))
-    #if bool(annotations[ANNOTATION_TESTING_ENVIRONMENT]):
     if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true':
         create_guacamole_connection(name, namespace, spec, annotations, logger)
     notify_dataset_access(spec, name, namespace, logger, body, uid, annotations)
@@ -265,6 +264,10 @@ def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch,
     logger.debug("############# Adding securityContext: " + json.dumps(dict(securityContext)))
     patch.spec['template'] = {'spec': {'securityContext': securityContext}}
 
+    if not ANNOTATION_TOOL_NAME in annotations: 
+        raise kopf.AdmissionError(f"Missing annotation '{ANNOTATION_TOOL_NAME}'")
+    if not ANNOTATION_TOOL_VERSION in annotations: 
+        raise kopf.AdmissionError(f"Missing annotation '{ANNOTATION_TOOL_VERSION}'")
     datasets = annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
     toolName = annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
     if not isinstance(datasets, list):
@@ -379,7 +382,7 @@ def notify_dataset_access(spec, name, namespace, logger, body, uid, annotations)
     logger.debug("############# ANNOTATIONS: " + json.dumps(dict(annotations)))
     datasets =           annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
     username =           annotations[ANNOTATION_USERNAME]
-    testingEnvironment = bool(annotations[ANNOTATION_TESTING_ENVIRONMENT])
+    testingEnvironment = (str(annotations[ANNOTATION_TESTING_ENVIRONMENT]).strip().lower() == "true")
     toolName =           annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
     toolVersion =        annotations[ANNOTATION_TOOL_VERSION].replace(" ", "")
     access_token = get_access_token(logger)
@@ -393,7 +396,7 @@ def notify_end_of_dataset_access(spec, name, namespace, logger, body, uid, annot
     logger.debug("############# ANNOTATIONS: " + json.dumps(dict(annotations)))
     datasets =           annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
     username =           annotations[ANNOTATION_USERNAME] if ANNOTATION_USERNAME in annotations else "unknown"
-    testingEnvironment = bool(annotations[ANNOTATION_TESTING_ENVIRONMENT]) if ANNOTATION_TESTING_ENVIRONMENT in annotations else False
+    testingEnvironment = (ANNOTATION_TESTING_ENVIRONMENT in annotations and str(annotations[ANNOTATION_TESTING_ENVIRONMENT]).strip().lower() == "true")
     toolName =           annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
     toolVersion =        annotations[ANNOTATION_TOOL_VERSION].replace(" ", "")
     access_token = get_access_token(logger)
