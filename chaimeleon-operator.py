@@ -8,9 +8,10 @@ import time
 import guacli.guacamoleClient as guac
 import http.client
 import urllib.parse
+import copy
 from datetime import datetime
 
-__VERSION__ = "2.1.0"
+__VERSION__ = "2.2.0"
 
 OPERATOR_SERVICE_ACCOUNT_NAME = None
 OPERATOR_SERVICE_ACCOUNT_NAMESPACE = None
@@ -130,12 +131,18 @@ ANNOTATION_TESTING_ENVIRONMENT = "chaimeleon.eu/testingEnvironment"
 
 DATASET_ACCESS_ANNOTATIONS = {ANNOTATION_DATASETS_IDS: kopf.PRESENT, ANNOTATION_TOOL_NAME: kopf.PRESENT, ANNOTATION_TOOL_VERSION: kopf.PRESENT}
 
+def is_user_namespace(namespace, **_):
+    return str(namespace).startswith("user-")
+
+def without_nodeselector_nor_affinity(spec, **_):
+    return not 'nodeSelector' in spec and not 'affinity' in spec
+
 # The 'id' is required when multiple decorators on the same function.
 # The 'param' is useful for identifying which decorator has been triggered.
 
-@kopf.on.mutate('apps/v1', 'deployments', id='mutate_deployment_fn', param='deployment', annotations=DATASET_ACCESS_ANNOTATIONS)
-@kopf.on.mutate('batch/v1', 'jobs', id='mutate_job_fn', param='job', annotations=DATASET_ACCESS_ANNOTATIONS)
-def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, name, namespace, annotations, **_):
+@kopf.on.mutate('apps/v1', 'deployments', id='mutate_deployment_fn', param='deployment', when=is_user_namespace)
+@kopf.on.mutate('batch/v1', 'jobs', id='mutate_job_fn', param='job', when=is_user_namespace)
+def mutate_deployment_or_job_fn(param, body, spec, patch, logger, userinfo, uid, name, namespace, annotations, **_):
     # Skip the modifications performed by system service accounts
     if userinfo['username'] in SYSTEM_SERVICE_ACCOUNTS: return
     # We only have to manage deployments and jobs from normal users, and they only have permissions to deploy in their own namespaces
@@ -145,7 +152,10 @@ def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, name,
     # userinfo is the k8s user, which can be an admin deploying or adjusting a deployment for the user
     
     logger.debug("############# EVENT for prepare "+param)
-    prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch, logger, username)
+    if ANNOTATION_DATASETS_IDS in annotations and len(annotations[ANNOTATION_DATASETS_IDS]) > 0:
+        prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, username)
+    set_nodeselector_and_resources_in_deployment_or_job(body, patch, logger, param)
+    logger.debug("########### FINAL PATCH: " + json.dumps(dict(patch)))
     logger.debug(f"Mutation ended successfully")
 
 
@@ -159,24 +169,26 @@ def mutate_deployment_or_job_fn(param, spec, patch, logger, userinfo, uid, name,
 #
 #     validate_dataset_access(spec, logger, userinfo, body, warnings, headers, uid, annotations)
 
-@kopf.on.create('apps/v1', 'deployments', id='create_deployment_fn', param='deployment', annotations=DATASET_ACCESS_ANNOTATIONS)
-@kopf.on.create('batch/v1', 'jobs', id='create_job_fn', param='job', annotations=DATASET_ACCESS_ANNOTATIONS)
+@kopf.on.create('apps/v1', 'deployments', id='create_deployment_fn', param='deployment', when=is_user_namespace)
+@kopf.on.create('batch/v1', 'jobs', id='create_job_fn', param='job', when=is_user_namespace)
 def create_deployment_or_job_fn(param, spec, name, namespace, logger, body, uid, annotations, **kwargs):
     logger.debug("############# EVENT for notify the start of dataset access by a "+ param)
     # logger.debug("############# BODY: "+ json.dumps(dict(body)))
     if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true':
         create_guacamole_connection(name, namespace, spec, annotations, logger)
-    notify_dataset_access(spec, name, namespace, logger, body, uid, annotations)
+    if ANNOTATION_DATASETS_IDS in annotations and len(annotations[ANNOTATION_DATASETS_IDS]) > 0:
+        notify_dataset_access(spec, name, namespace, logger, body, uid, annotations)
 
 # @kopf.on.update('apps/v1', 'deployments', annotations=DATASET_ACCESS_ANNOTATIONS)
 # def my_handler(spec, old, new, diff, **_):
 #     pass
 
-@kopf.on.delete('apps/v1', 'deployments', id='delete_deployment_fn', param='deployment', annotations=DATASET_ACCESS_ANNOTATIONS)
-@kopf.on.delete('batch/v1', 'jobs', id='delete_job_fn', param='job', annotations=DATASET_ACCESS_ANNOTATIONS)
+@kopf.on.delete('apps/v1', 'deployments', id='delete_deployment_fn', param='deployment', when=is_user_namespace)
+@kopf.on.delete('batch/v1', 'jobs', id='delete_job_fn', param='job', when=is_user_namespace)
 def delete_deployment_or_job_fn(param, spec, name, namespace, logger, body, uid, annotations, **kwargs):
     logger.debug("############# EVENT for notify the end of dataset access by a " + param)
-    notify_end_of_dataset_access(spec, name, namespace, logger, body, uid, annotations)
+    if ANNOTATION_DATASETS_IDS in annotations and len(annotations[ANNOTATION_DATASETS_IDS]) > 0:
+        notify_end_of_dataset_access(spec, name, namespace, logger, body, uid, annotations)
     if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true':
         delete_guacamole_connection(name, annotations, logger)
 
@@ -221,6 +233,7 @@ def create_guacamole_connection(name, namespace, spec, annotations, logger):
     client.login(GUACAMOLE_USER, GUACAMOLE_PASSWORD)
     logger.debug('Login success.')
 
+    if not ANNOTATION_USERNAME in annotations: return
     username = annotations[ANNOTATION_USERNAME]
     connectionGroupId = client.getConnectionGroupId(username)
     if connectionGroupId is None: logger.warning('Connection group "'+username+'" not found.'); return
@@ -258,11 +271,97 @@ def delete_guacamole_connection(name, annotations, logger):
     logger.debug(f'Deleting guacamole connection {connectionId}: {connectionName}')
     client.deleteConnection(connectionId)
 
-def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch, logger, username):
-    logger.debug("############# prev securityContext (SPEC): " + json.dumps(spec['template']['spec']['securityContext']))
+
+def create_hierarchy_in_patch(body, patch, path: str):
+    ''' Create a hierarchy of empty objects if not exists to define a path in patch.
+        Use ':' as a separator for objects (parentObject:childObject:).
+        Use '#' as a separator for index in array (parentObject:childArray#2:).
+        Example: 
+            for the path: 'spec:template:spec:nodeSelector' or just 'spec:template:spec:'
+            if the patch previously is: {'labels': {}, 'spec': {'parallelism': 1}}
+            then the patch will be:     {'labels': {}, 'spec': {'parallelism': 1, 'template': {'spec': {}}}}
+        Example with array: 
+            for the path: 'spec:template:spec:containers#0:name' or just 'spec:template:spec:containers#0:'
+            if the patch previously is: {'labels': {}, 'spec': {'parallelism': 1}}
+            then the patch will be:     {'labels': {}, 'spec': {'parallelism': 1, 'template': {'spec': {'containers': [{'name':'c0'}, {'name':'c1'}]}}}}
+    '''
+    hierarchy = path.split(':')
+    current = patch
+    current0 = body
+    for item in hierarchy[:-1]:
+        isArray = item.find('#') > -1   # this item is an array if contains the separator for the index in array
+        if isArray:
+            property, index = item.split('#')
+            index = int(index)
+            if not property in current:
+                # Arrays must be copied entirely from the original body, this is because the arrays items in patch are overriden, not merged
+                # (Ref: https://kopf.readthedocs.io/en/stable/kwargs/#patching)
+                current[property] = copy.deepcopy(current0[property])
+            current = current[property][index]
+            current0 = current0[property][index]
+        else:
+            if not item in current:
+                # In case of object, it can be empty (dicts in patch are merged)
+                current[item] = {}
+            current = current[item]
+            current0 = current0[item]
+    return current
+
+def set_value_in_patch(body, patch, path: str, value):
+    ''' Set the indicated value in the patch at the path especified, creating empty objects if not exists to define the path.
+        Example: set_value_in_patch(patch, 'spec:template:spec:nodeSelector:chaimeleon.eu/target', 'medium-gpu')
+    '''
+    current = create_hierarchy_in_patch(body, patch, path)
+    key = path[path.rindex(':')+1:]
+    current[key] = value
+
+def set_nodeselector_and_resources_in_deployment_or_job(body, patch, logger, param):
+    if not ANNOTATION_JOB_RESOURCES_FLAVOR in body['metadata']['annotations']: 
+        #raise kopf.AdmissionError(f"Missing annotation '{ANNOTATION_JOB_RESOURCES_FLAVOR}'")
+        type_of_job = 'desktop' if param == 'deployment' else 'large-gpu'
+    else:
+        type_of_job = str(body['metadata']['annotations'][ANNOTATION_JOB_RESOURCES_FLAVOR]).strip().lower()
+
+    if type_of_job == 'desktop':      node_label_value = 'desktops';   cpu = '900m'; maxcpu = '2'; memory = '7Gi';  gpu = False
+    elif type_of_job == 'small-gpu':  node_label_value = 'small-gpu';  cpu = '3'; maxcpu = '6'; memory = '28Gi'; gpu = True
+    elif type_of_job == 'medium-gpu': node_label_value = 'medium-gpu'; cpu = '7'; maxcpu = '8'; memory = '60Gi'; gpu = True
+    elif type_of_job == 'large-gpu':  node_label_value = 'large-gpu';  cpu = '7'; maxcpu = '8'; memory = '60Gi'; gpu = True
+    elif type_of_job == 'no-gpu':     node_label_value = 'no-gpu';     cpu = '7'; maxcpu = '8'; memory = '60Gi'; gpu = False
+    else: raise kopf.AdmissionError(f"The annotation '{ANNOTATION_JOB_RESOURCES_FLAVOR}' has unkown value '{type_of_job}'.")
+
+    # Doc: 'nodeSelector' is the simplest method and 'nodeAffinity' is more powerfull
+    # https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
+    node_selector = {'chaimeleon.eu/target': node_label_value}
+    logger.debug("############# Adding nodeSelector: " + json.dumps(dict(node_selector)))
+    set_value_in_patch(body, patch, 'spec:template:spec:nodeSelector', node_selector)
+    # affinity = {
+    #     'nodeAffinity': {
+    #         'requiredDuringSchedulingIgnoredDuringExecution': {
+    #             'nodeSelectorTerms': [{
+    #                 'matchExpressions': [{
+    #                     'key': 'chaimeleon.eu/target', 'operator': 'In', 'values': [node_label_value]
+    #                 }]}]}}}
+    # logger.debug("############# Adding affinity: " + json.dumps(dict(affinity)))
+    # set_value_in_patch(body, patch, 'spec:template:spec:affinity', affinity)
+
+    resources = {
+        'requests': { 'cpu': cpu, 'memory': memory },
+        'limits': { 'cpu': maxcpu, 'memory': memory }}
+    if gpu:
+        resources["requests"]["nvidia.com/gpu"] = '1'
+        resources["limits"]["nvidia.com/gpu"] = '1'
+    logger.debug("############# Adding resources: " + json.dumps(dict(resources)))
+    # Check: there must be only one container
+    if len(body['spec']['template']['spec']['containers']) > 1:
+        raise kopf.AdmissionError("Only one container is allowed per pod.")
+    set_value_in_patch(body, patch, 'spec:template:spec:containers#0:resources', resources)     # set the resources of the unique container
+    
+def prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, username):
+    annotations = body['metadata']['annotations']
+    logger.debug("############# prev securityContext (SPEC): " + json.dumps(body['spec']['template']['spec']['securityContext']))
     securityContext = {'runAsUser': 1000, 'runAsGroup': 1000, 'fsGroup': 1000}
     logger.debug("############# Adding securityContext: " + json.dumps(dict(securityContext)))
-    patch.spec['template'] = {'spec': {'securityContext': securityContext}}
+    set_value_in_patch(body, patch, 'spec:template:spec:securityContext', securityContext)
 
     if not ANNOTATION_TOOL_NAME in annotations: 
         raise kopf.AdmissionError(f"Missing annotation '{ANNOTATION_TOOL_NAME}'")
@@ -283,7 +382,7 @@ def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch,
         if user_gid is None:
             raise kopf.AdmissionError("Cannot validate the deployment, please retry in few minutes and if the problem persists contact the administrators.")
         logger.debug(f"############# Adding GID {str(user_gid)} to securityContext.supplementalGroups")
-        patch.spec['template']['spec']['securityContext']['supplementalGroups'] = [user_gid]
+        set_value_in_patch(body, patch, 'spec:template:spec:securityContext:supplementalGroups', [user_gid])
         
         # Check with Dataset Service if the user can use the datasets requested
         access_checked = check_access_dataset(logger, access_token, username, datasets, DATASET_SERVICE_ENDPOINT)
@@ -299,8 +398,8 @@ def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch,
                 else:
                     testingEnvironment = True
                     logger.debug("############# Changing paths of volumes (datalake and datasets) for testing environment")
-                    patch.spec['template']['spec']['volumes'] = spec['template']['spec']['volumes']
-                    for vol in patch.spec['template']['spec']['volumes']:
+                    set_value_in_patch(body, patch, 'spec:template:spec:volumes', body['spec']['template']['spec']['volumes'])
+                    for vol in patch['spec']['template']['spec']['volumes']:
                         if vol['name'] == 'datalake':
                             vol['cephfs']['path'] = "/datalake-test"
                         if str(vol['cephfs']['path']).startswith('/datasets/'):
@@ -316,7 +415,7 @@ def prepare_deployment_or_job_for_dataset_access(name, annotations, spec, patch,
         and not ANNOTATION_GUACAMOLE_CONNECTION_NAME in annotations:
         newAnnotations[ANNOTATION_GUACAMOLE_CONNECTION_NAME] = datetime.today().strftime('%Y-%m-%d-%H-%M-%S') + "---" + name
     logger.debug("############# Adding annotations: " + json.dumps(dict(newAnnotations)))
-    patch.metadata['annotations'] = newAnnotations
+    set_value_in_patch(body, patch, 'metadata:annotations', newAnnotations)
 
 # def validate_dataset_access(spec, logger, userinfo, body, warnings, headers, uid, annotations):
 #     _spec = dict(spec)
