@@ -11,7 +11,7 @@ import urllib.parse
 import copy
 from datetime import datetime
 
-__VERSION__ = "2.2.0"
+__VERSION__ = "2.3.0"
 
 OPERATOR_SERVICE_ACCOUNT_NAME = None
 OPERATOR_SERVICE_ACCOUNT_NAMESPACE = None
@@ -21,6 +21,7 @@ KEYCLOAK_ENDPOINT= None
 KEYCLOAK_REALM = None
 DATASET_SERVICE_ENDPOINT = None
 DATASET_SERVICE_TEST_ENDPOINT = None
+INTERNAL_IMAGE_REPOSITORY_CHECK = None
 
 KEYCLOAK_MAX_RETRIES = None
 DATASET_SERVICE_MAX_RETRIES = None
@@ -50,6 +51,7 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     global K8S_USER_PREFIX, OPERATOR_SERVICE_ACCOUNT_NAMESPACE, OPERATOR_SERVICE_ACCOUNT_NAME, SYSTEM_SERVICE_ACCOUNTS
     global GUACAMOLE_URL, GUACAMOLE_USER, GUACAMOLE_PASSWORD, GUACAMOLE_CONNECTIONS_BACKEND_HOST
     global GUACAMOLE_CONNECTIONS_VNC_PORT, GUACAMOLE_CONNECTIONS_SFTP_USERNAME, GUACAMOLE_CONNECTIONS_SFTP_PORT
+    global INTERNAL_IMAGE_REPOSITORY_CHECK
 
     # Required ENV vars
     KEYCLOAK_CLIENT = os.getenv('KEYCLOAK_CLIENT')
@@ -69,6 +71,8 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     K8S_USER_PREFIX = str(os.getenv('K8S_USER_PREFIX'))
     DATASET_SERVICE_TEST_ENDPOINT = os.getenv('DATASET_SERVICE_TEST_ENDPOINT')
     if DATASET_SERVICE_TEST_ENDPOINT == "": DATASET_SERVICE_TEST_ENDPOINT = None
+    INTERNAL_IMAGE_REPOSITORY_CHECK = os.getenv('INTERNAL_IMAGE_REPOSITORY_CHECK')
+    if INTERNAL_IMAGE_REPOSITORY_CHECK == "": INTERNAL_IMAGE_REPOSITORY_CHECK = None
 
     GUACAMOLE_URL = os.environ.get('GUACAMOLE_URL', GUACAMOLE_URL)
     GUACAMOLE_USER = os.environ.get('GUACAMOLE_USER', GUACAMOLE_USER)
@@ -152,8 +156,8 @@ def mutate_deployment_or_job_fn(param, body, spec, patch, logger, userinfo, uid,
     # userinfo is the k8s user, which can be an admin deploying or adjusting a deployment for the user
     
     logger.debug("############# EVENT for prepare "+param)
-    if ANNOTATION_DATASETS_IDS in annotations and len(annotations[ANNOTATION_DATASETS_IDS]) > 0:
-        prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, username)
+    prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, username, param=='job')
+
     set_nodeselector_and_resources_in_deployment_or_job(body, patch, logger, param)
     logger.debug("########### FINAL PATCH: " + json.dumps(dict(patch)))
     logger.debug(f"Mutation ended successfully")
@@ -177,7 +181,8 @@ def create_deployment_or_job_fn(param, spec, name, namespace, logger, body, uid,
     if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true':
         create_guacamole_connection(name, namespace, spec, annotations, logger)
     if ANNOTATION_DATASETS_IDS in annotations and len(annotations[ANNOTATION_DATASETS_IDS]) > 0:
-        notify_dataset_access(spec, name, namespace, logger, body, uid, annotations)
+        if param=='deployment':    # don't notify to the tracer for jobs (temporal condition until dataset-service accepts the new param 'notifyTracer')
+            notify_dataset_access(spec, name, namespace, logger, body, uid, annotations, param=='job')
 
 # @kopf.on.update('apps/v1', 'deployments', annotations=DATASET_ACCESS_ANNOTATIONS)
 # def my_handler(spec, old, new, diff, **_):
@@ -260,6 +265,7 @@ def delete_guacamole_connection(name, annotations, logger):
     client.login(GUACAMOLE_USER, GUACAMOLE_PASSWORD)
     logger.debug('Login success.')
 
+    if not ANNOTATION_USERNAME in annotations: logger.warning('Missing annotation "'+ANNOTATION_USERNAME+'".'); return
     username = annotations[ANNOTATION_USERNAME]
     connectionGroupId = client.getConnectionGroupId(username)
     if connectionGroupId is None: logger.warning('Connection group "'+username+'" not found.'); return
@@ -318,7 +324,7 @@ def set_value_in_patch(body, patch, path: str, value):
 def set_nodeselector_and_resources_in_deployment_or_job(body, patch, logger, param):
     if not ANNOTATION_JOB_RESOURCES_FLAVOR in body['metadata']['annotations']: 
         #raise kopf.AdmissionError(f"Missing annotation '{ANNOTATION_JOB_RESOURCES_FLAVOR}'")
-        type_of_job = 'desktop' if param == 'deployment' else 'large-gpu'
+        type_of_job = 'desktop' if param == 'deployment' else 'medium-gpu'
     else:
         type_of_job = str(body['metadata']['annotations'][ANNOTATION_JOB_RESOURCES_FLAVOR]).strip().lower()
 
@@ -351,59 +357,86 @@ def set_nodeselector_and_resources_in_deployment_or_job(body, patch, logger, par
         resources["requests"]["nvidia.com/gpu"] = '1'
         resources["limits"]["nvidia.com/gpu"] = '1'
     logger.debug("############# Adding resources: " + json.dumps(dict(resources)))
-    # Check: there must be only one container
-    if len(body['spec']['template']['spec']['containers']) > 1:
-        raise kopf.AdmissionError("Only one container is allowed per pod.")
-    set_value_in_patch(body, patch, 'spec:template:spec:containers#0:resources', resources)     # set the resources of the unique container
-    
-def prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, username):
+    num_containers = len(body['spec']['template']['spec']['containers'])
+    if num_containers == 0:
+        raise kopf.AdmissionError("0 containers detected.")
+    elif num_containers == 1:
+        set_value_in_patch(body, patch, 'spec:template:spec:containers#0:resources', resources)   # set the resources of the unique container
+    else:
+        # special case to be defined
+        return
+
+def check_image(image):
+    if INTERNAL_IMAGE_REPOSITORY_CHECK is None: return
+    if not str(image).startswith(INTERNAL_IMAGE_REPOSITORY_CHECK):
+        raise kopf.AdmissionError(f"The image must be one of our internal repository '{INTERNAL_IMAGE_REPOSITORY_CHECK}'")
+
+def check_images(body):
+    spec = body['spec']['template']['spec']
+    for container in spec['containers']: check_image(container['image'])
+    if 'initContainers' in spec:
+        for container in spec['initContainers']: check_image(container['image'])
+
+def getImageFromFirstContainer(body):
+    image = str(body['spec']['template']['spec']['containers'][0]['image'])
+    # image example: 'harbor.chaimeleon-eu.i3m.upv.es:5000/chaimeleon-library-batch/mri_harmonization:latest-cuda'
+    i = image.index('/')
+    image = image[i+1:]
+    if image.find(':') == -1: image += ':latest'
+    return image
+
+def try_check_access_in_dataset_service_test(logger, access_token, username, user_gid, datasets, body, patch):
+    logger.warning("############# Trying to check the access in the Dataset-service test endpoint...")
+    # This is needed to synchronize the DB of the test service with the production DB which is the "master" provider of user GIDs.
+    put_user_gid_in_test_dataset_service(logger, access_token, username, user_gid)
+    access_checked = check_access_dataset(logger, access_token, username, datasets, DATASET_SERVICE_TEST_ENDPOINT)
+    if len(access_checked["denied"])>0:
+        return False
+
+    logger.debug("############# Changing paths of volumes (datalake and datasets) for testing environment")
+    set_value_in_patch(body, patch, 'spec:template:spec:volumes', body['spec']['template']['spec']['volumes'])
+    for vol in patch['spec']['template']['spec']['volumes']:
+        if vol['name'] == 'datalake':
+            vol['cephfs']['path'] = "/datalake-test"
+        if str(vol['cephfs']['path']).startswith('/datasets/'):
+            vol['cephfs']['path'] = "/datasets-test/"+vol['name']
+    return True
+
+def prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, username, is_job):
     annotations = body['metadata']['annotations']
     logger.debug("############# prev securityContext (SPEC): " + json.dumps(body['spec']['template']['spec']['securityContext']))
     securityContext = {'runAsUser': 1000, 'runAsGroup': 1000, 'fsGroup': 1000}
     logger.debug("############# Adding securityContext: " + json.dumps(dict(securityContext)))
     set_value_in_patch(body, patch, 'spec:template:spec:securityContext', securityContext)
 
-    if not ANNOTATION_TOOL_NAME in annotations: 
-        raise kopf.AdmissionError(f"Missing annotation '{ANNOTATION_TOOL_NAME}'")
-    if not ANNOTATION_TOOL_VERSION in annotations: 
-        raise kopf.AdmissionError(f"Missing annotation '{ANNOTATION_TOOL_VERSION}'")
-    datasets = annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
-    toolName = annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
-    if not isinstance(datasets, list):
-        raise kopf.AdmissionError(f"The annotation '{ANNOTATION_DATASETS_IDS}' must be a list of datasetsIDs sepparated with ','")
+    access_token = get_access_token(logger)
+    if not access_token:
+        raise kopf.AdmissionError("Cannot validate the deployment, please retry in few minutes and if the problem persists contact the administrators.")
+    user_gid = get_user_gid(logger, access_token, username)
+    if user_gid is None:
+        raise kopf.AdmissionError("Cannot validate the deployment, please retry in few minutes and if the problem persists contact the administrators.")
+    logger.debug(f"############# Adding GID {str(user_gid)} to securityContext.supplementalGroups")
+    set_value_in_patch(body, patch, 'spec:template:spec:securityContext:supplementalGroups', [user_gid])
+
+    check_images(body)
+    image = getImageFromFirstContainer(body)
+    datasets = []
+    if ANNOTATION_DATASETS_IDS in annotations and len(annotations[ANNOTATION_DATASETS_IDS]) > 0:
+        datasets = annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
+        if not isinstance(datasets, list):
+            raise kopf.AdmissionError(f"The annotation '{ANNOTATION_DATASETS_IDS}' must be a list of datasetsIDs sepparated with ','")
     testingEnvironment = False
     if len(datasets) == 0:
-        logger.info(f"User {username} will deploy toolName={toolName} without datasets")
+        logger.info(f"User {username} will deploy {image} without datasets")
     else:
-        access_token = get_access_token(logger)
-        if not access_token:
-            raise kopf.AdmissionError("Cannot validate the deployment, please retry in few minutes and if the problem persists contact the administrators.")
-        user_gid = get_user_gid(logger, access_token, username)
-        if user_gid is None:
-            raise kopf.AdmissionError("Cannot validate the deployment, please retry in few minutes and if the problem persists contact the administrators.")
-        logger.debug(f"############# Adding GID {str(user_gid)} to securityContext.supplementalGroups")
-        set_value_in_patch(body, patch, 'spec:template:spec:securityContext:supplementalGroups', [user_gid])
-        
         # Check with Dataset Service if the user can use the datasets requested
         access_checked = check_access_dataset(logger, access_token, username, datasets, DATASET_SERVICE_ENDPOINT)
         if len(access_checked["denied"])>0:
             logger.warning(f"User {username} is trying to use dataset(s) that is not allowed or not exist: " + str(access_checked["denied"]))
             if access_checked['return_code'] == 403 and len(access_checked["granted"]) == 0 and DATASET_SERVICE_TEST_ENDPOINT != None:
-                logger.warning("############# Trying to check the access in the Dataset-service test endpoint...")
-                # This is needed to synchronize the DB of the test service with the production DB which is the "master" provider of user GIDs.
-                put_user_gid_in_test_dataset_service(logger, access_token, username, user_gid)
-                access_checked = check_access_dataset(logger, access_token, username, datasets, DATASET_SERVICE_TEST_ENDPOINT)
-                if len(access_checked["denied"])>0:
-                    raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
-                else:
-                    testingEnvironment = True
-                    logger.debug("############# Changing paths of volumes (datalake and datasets) for testing environment")
-                    set_value_in_patch(body, patch, 'spec:template:spec:volumes', body['spec']['template']['spec']['volumes'])
-                    for vol in patch['spec']['template']['spec']['volumes']:
-                        if vol['name'] == 'datalake':
-                            vol['cephfs']['path'] = "/datalake-test"
-                        if str(vol['cephfs']['path']).startswith('/datasets/'):
-                            vol['cephfs']['path'] = "/datasets-test/"+vol['name']
+                ok = try_check_access_in_dataset_service_test(logger, access_token, username, user_gid, datasets, body, patch)
+                if ok: testingEnvironment = True
+                else: raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
             else:
                 raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
 
@@ -412,7 +445,7 @@ def prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, user
     newAnnotations[ANNOTATION_USERNAME] = username
     newAnnotations[ANNOTATION_TESTING_ENVIRONMENT] = str(testingEnvironment)
     if ANNOTATION_CREATE_GUACAMOLE_CONNECTION in annotations and str(annotations[ANNOTATION_CREATE_GUACAMOLE_CONNECTION]).strip().lower() == 'true' \
-        and not ANNOTATION_GUACAMOLE_CONNECTION_NAME in annotations:
+       and not ANNOTATION_GUACAMOLE_CONNECTION_NAME in annotations:
         newAnnotations[ANNOTATION_GUACAMOLE_CONNECTION_NAME] = datetime.today().strftime('%Y-%m-%d-%H-%M-%S') + "---" + name
     logger.debug("############# Adding annotations: " + json.dumps(dict(newAnnotations)))
     set_value_in_patch(body, patch, 'metadata:annotations', newAnnotations)
@@ -477,17 +510,25 @@ def prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, user
 
 #         logger.debug(f"Validation uid={uid} ended successfully")
 
-def notify_dataset_access(spec, name, namespace, logger, body, uid, annotations):
+def notify_dataset_access(spec, name, namespace, logger, body, uid, annotations, is_job):
     logger.debug("############# ANNOTATIONS: " + json.dumps(dict(annotations)))
     datasets =           annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
     username =           annotations[ANNOTATION_USERNAME]
     testingEnvironment = (str(annotations[ANNOTATION_TESTING_ENVIRONMENT]).strip().lower() == "true")
-    toolName =           annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
-    toolVersion =        annotations[ANNOTATION_TOOL_VERSION].replace(" ", "")
+    image = getImageFromFirstContainer(body)
+    if ANNOTATION_TOOL_NAME in annotations:
+        toolName =    annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
+        toolVersion = annotations[ANNOTATION_TOOL_VERSION].replace(" ", "") if ANNOTATION_TOOL_VERSION in annotations else ""
+    else: 
+        toolName, toolVersion = image.split(':')
+    container0 = body['spec']['template']['spec']['containers'][0]
+    commandLine = ' '.join(container0['command']) if 'command' in container0 else '# '
+    commandLine += ' '.join(container0['args']) if 'args' in container0 else ''
     access_token = get_access_token(logger)
-    ok = access_dataset(logger, access_token, uid, username, datasets, toolName, toolVersion, testingEnvironment)
-    log_text = ("uid={} -> Access dataset {}successfully notified: User={}, tool={}:{} , datasets={}{}"
-                .format(uid, "" if ok else "un", username, toolName, toolVersion, str(datasets), ", (testingEnvironment)" if testingEnvironment else ""))
+    notifyTracer = not is_job
+    ok = access_dataset(logger, access_token, uid, username, datasets, toolName, toolVersion, image, commandLine, notifyTracer, testingEnvironment)
+    log_text = ("uid={} -> Access dataset {}successfully notified: User={}, tool={}:{}, image={}, command={}, datasets={}{}"
+                .format(uid, "" if ok else "un", username, toolName, toolVersion, image, commandLine, str(datasets), ", (testingEnvironment)" if testingEnvironment else ""))
     if ok: logger.info(log_text)
     else: logger.error(log_text)
     
@@ -496,12 +537,11 @@ def notify_end_of_dataset_access(spec, name, namespace, logger, body, uid, annot
     datasets =           annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
     username =           annotations[ANNOTATION_USERNAME] if ANNOTATION_USERNAME in annotations else "unknown"
     testingEnvironment = (ANNOTATION_TESTING_ENVIRONMENT in annotations and str(annotations[ANNOTATION_TESTING_ENVIRONMENT]).strip().lower() == "true")
-    toolName =           annotations[ANNOTATION_TOOL_NAME].replace(" ", "")
-    toolVersion =        annotations[ANNOTATION_TOOL_VERSION].replace(" ", "")
+    image = getImageFromFirstContainer(body)
     access_token = get_access_token(logger)
     ok = finalise_access_dataset(logger, access_token, uid, testingEnvironment)
-    log_text = ("uid={} -> End of dataset access {}successfully notified: User={}, tool={}:{} , datasets:{}{}"
-                .format(uid, "" if ok else "un", username, toolName, toolVersion, str(datasets), ", (testingEnvironment)" if testingEnvironment else ""))
+    log_text = ("uid={} -> End of dataset access {}successfully notified: User={}, image={} , datasets={}{}"
+                .format(uid, "" if ok else "un", username, image, str(datasets), ", (testingEnvironment)" if testingEnvironment else ""))
     if ok: logger.info(log_text)
     else: logger.error( log_text )
 
@@ -570,10 +610,11 @@ def put_user_gid_in_test_dataset_service(logger, access_token, username, user_gi
     else:
         logger.error(f"Error at --put_user_gid_in_test_dataset_service-- function: ({response.status_code}) {response.text}")
 
-def access_dataset(logger, access_token, id, username, datasets_list, toolName, toolVersion, testingDatalake):
+def access_dataset(logger, access_token, id, username, datasets_list, toolName, toolVersion, image, commandLine, notifyTracer, testingDatalake):
     endpoint = DATASET_SERVICE_TEST_ENDPOINT if testingDatalake else DATASET_SERVICE_ENDPOINT
     URL = f"{endpoint}/api/datasetAccess/{id}"
-    data = { "userName": username, "datasets": datasets_list, "toolName": toolName, "toolVersion": toolVersion }
+    data = { "userName": username, "datasets": datasets_list, "notifyTracer": notifyTracer,
+             "toolName": toolName, "toolVersion": toolVersion, "image": image, "commandLine": commandLine }
     headers = { "Content-Type": "application/json", "Accept": "application/json", "Authorization": "bearer " + access_token }
     logger.debug( f"uid={id} -> User {username} with {toolName}:{toolVersion} is using the following datasets: {str(datasets_list)}" )
     response =  do_request(URL, "POST", logger, DATASET_SERVICE_MAX_RETRIES, headers=headers, data=json.dumps(data), verify=False)

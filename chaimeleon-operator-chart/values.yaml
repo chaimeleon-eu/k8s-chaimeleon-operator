@@ -30,6 +30,7 @@ operatorConfiguration:
   datasetServiceEndpoint: ""
   # Optional, set only if you have an endpoint for testing
   datasetServiceTestEndpoint: ""
+  internalImageRepositoryCheck: ""
   k8sUserPrefix: ""
   guacamoleURL: ""
   guacamoleUser: ""

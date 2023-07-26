@@ -51,6 +51,8 @@ spec:
               value: "{{ .Values.operatorConfiguration.datasetServiceEndpoint }}"
             - name: DATASET_SERVICE_TEST_ENDPOINT
               value: "{{ .Values.operatorConfiguration.datasetServiceTestEndpoint }}"
+            - name: INTERNAL_IMAGE_REPOSITORY_CHECK
+              value: "{{ .Values.operatorConfiguration.internalImageRepositoryCheck }}"
             - name: K8S_USER_PREFIX
               value: "{{- include "chaimeleon-operator.k8sUserPrefix" . }}"
             - name: OPERATOR_SERVICE_ACCOUNT_NAME
