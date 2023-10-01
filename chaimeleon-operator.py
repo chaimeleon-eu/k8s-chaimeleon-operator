@@ -134,6 +134,7 @@ ANNOTATION_JOB_RESOURCES_FLAVOR = "chaimeleon.eu/jobResourcesFlavor"
 ANNOTATION_TESTING_ENVIRONMENT = "chaimeleon.eu/testingEnvironment"
 
 DATASET_ACCESS_ANNOTATIONS = {ANNOTATION_DATASETS_IDS: kopf.PRESENT, ANNOTATION_TOOL_NAME: kopf.PRESENT, ANNOTATION_TOOL_VERSION: kopf.PRESENT}
+ADMINS_GROUP = "oidc:cloud-services-and-security-management"
 
 def is_user_namespace(namespace, **_):
     return str(namespace).startswith("user-")
@@ -154,9 +155,11 @@ def mutate_deployment_or_job_fn(param, body, spec, patch, logger, userinfo, uid,
     username = namespace[5:]
     #username = userinfo['username'][ len(K8S_USER_PREFIX): ]    # Remove Kubernetes prefix for username
     # userinfo is the k8s user, which can be an admin deploying or adjusting a deployment for the user
+    logger.debug("############# USERINFO: "+json.dumps(dict(userinfo)))
+    is_admin = (ADMINS_GROUP in userinfo['groups'])
     
     logger.debug("############# EVENT for prepare "+param)
-    prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, username, param=='job')
+    prepare_deployment_or_job(name, body, patch, logger, username, param=='job', is_admin)
 
     set_nodeselector_and_resources_in_deployment_or_job(body, patch, logger, param)
     logger.debug("########### FINAL PATCH: " + json.dumps(dict(patch)))
@@ -385,6 +388,22 @@ def getImageFromFirstContainer(body):
     if image.find(':') == -1: image += ':latest'
     return image
 
+def get_cephfs_volumes_paths(body):
+    volumes_paths = []
+    spec = body['spec']['template']['spec']
+    for vol in spec['volumes']:
+        if 'cephfs' in vol:
+            volumes_paths.append(vol['cephfs']['path'])
+    return volumes_paths
+
+def check_volumes_match_datasets(volumes_paths: list[str], datasets: list[str]):
+    for vol_path in volumes_paths:
+        i = vol_path.find('/datasets/')
+        if i == -1: continue  # the path not corresponds with a dataset 
+        dataset_id = vol_path[i+10:]
+        if dataset_id not in datasets:
+            raise kopf.AdmissionError(f"There is one volume corresponding to a dataset not declared in the annotation '{ANNOTATION_DATASETS_IDS}'")    
+
 def try_check_access_in_dataset_service_test(logger, access_token, username, user_gid, datasets, body, patch):
     logger.warning("############# Trying to check the access in the Dataset-service test endpoint...")
     # This is needed to synchronize the DB of the test service with the production DB which is the "master" provider of user GIDs.
@@ -402,12 +421,18 @@ def try_check_access_in_dataset_service_test(logger, access_token, username, use
             vol['cephfs']['path'] = "/datasets-test/"+vol['name']
     return True
 
-def prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, username, is_job):
+def prepare_deployment_or_job(name, body, patch, logger, username, is_job, is_admin):
     annotations = body['metadata']['annotations']
-    logger.debug("############# prev securityContext (SPEC): " + json.dumps(body['spec']['template']['spec']['securityContext']))
-    securityContext = {'runAsUser': 1000, 'runAsGroup': 1000, 'fsGroup': 1000}
-    logger.debug("############# Adding securityContext: " + json.dumps(dict(securityContext)))
-    set_value_in_patch(body, patch, 'spec:template:spec:securityContext', securityContext)
+
+    cephfs_volumes_paths = get_cephfs_volumes_paths(body)
+    if len(cephfs_volumes_paths) > 0:
+        logger.debug("############# cephfs volumes paths: " + json.dumps(cephfs_volumes_paths))
+        if not is_admin or not 'securityContext' in body['spec']['template']['spec']:
+            prev_security_context = body['spec']['template']['spec']['securityContext'] if 'securityContext' in body['spec']['template']['spec'] else None
+            logger.debug("############# prev securityContext (SPEC): " + json.dumps(prev_security_context))
+            securityContext = {'runAsUser': 1000, 'runAsGroup': 1000, 'fsGroup': 1000}
+            logger.debug("############# Adding securityContext: " + json.dumps(dict(securityContext)))
+            set_value_in_patch(body, patch, 'spec:template:spec:securityContext', securityContext)
 
     access_token = get_access_token(logger)
     if not access_token:
@@ -425,6 +450,7 @@ def prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, user
         datasets = annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
         if not isinstance(datasets, list):
             raise kopf.AdmissionError(f"The annotation '{ANNOTATION_DATASETS_IDS}' must be a list of datasetsIDs sepparated with ','")
+    #check_volumes_match_datasets(cephfs_volumes_paths, datasets)
     testingEnvironment = False
     if len(datasets) == 0:
         logger.info(f"User {username} will deploy {image} without datasets")
@@ -439,6 +465,7 @@ def prepare_deployment_or_job_for_dataset_access(name, body, patch, logger, user
                 else: raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
             else:
                 raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
+
 
     # Store some info required later
     newAnnotations = {}
