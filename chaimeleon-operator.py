@@ -11,7 +11,6 @@ import urllib.parse
 import copy
 from datetime import datetime
 
-__VERSION__ = "2.3.0"
 
 OPERATOR_SERVICE_ACCOUNT_NAME = None
 OPERATOR_SERVICE_ACCOUNT_NAMESPACE = None
@@ -112,9 +111,10 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     if DATASET_SERVICE_TEST_ENDPOINT != None and DATASET_SERVICE_TEST_ENDPOINT[-1] == "/":
         DATASET_SERVICE_TEST_ENDPOINT = DATASET_SERVICE_TEST_ENDPOINT[:-1]  
     
+    with open('VERSION', 'r') as file: VERSION = file.readline()
     logger.info( "Chaimeleon operator (v{}) options: KEYCLOAK_CLIENT={}, KEYCLOAK_ENDPOINT={}, KEYCLOAK_REALM={}, "
                  "DATASET_SERVICE_ENDPOINT={}, DATASET_SERVICE_TEST_ENDPOINT={}, K8S_USER_PREFIX='{}'"
-                 .format(__VERSION__, KEYCLOAK_CLIENT, KEYCLOAK_ENDPOINT, KEYCLOAK_REALM, 
+                 .format(VERSION, KEYCLOAK_CLIENT, KEYCLOAK_ENDPOINT, KEYCLOAK_REALM, 
                          DATASET_SERVICE_ENDPOINT, DATASET_SERVICE_TEST_ENDPOINT, K8S_USER_PREFIX ) )
 
     # There are some special users that we must let them mutate resources without validate: they are trusted users and their changes are secure.
