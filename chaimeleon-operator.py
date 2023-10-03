@@ -324,23 +324,42 @@ def set_value_in_patch(body, patch, path: str, value):
     key = path[path.rindex(':')+1:]
     current[key] = value
 
-def set_nodeselector_and_resources_in_deployment_or_job(body, patch, logger, param):
-    if not ANNOTATION_JOB_RESOURCES_FLAVOR in body['metadata']['annotations']: 
-        #raise kopf.AdmissionError(f"Missing annotation '{ANNOTATION_JOB_RESOURCES_FLAVOR}'")
-        type_of_job = 'desktop' if param == 'deployment' else 'medium-gpu'
-    else:
-        type_of_job = str(body['metadata']['annotations'][ANNOTATION_JOB_RESOURCES_FLAVOR]).strip().lower()
+def set_nodeselector_and_resources_in_deployment_or_job(body, patch, logger, obj_type):
+    if obj_type == 'deployment':
+        if not ANNOTATION_TOOL_NAME in body['metadata']['annotations']:
+            raise kopf.AdmissionError(f"Missing annotation '{ANNOTATION_TOOL_NAME}'")
+        tool =  str(body['metadata']['annotations'][ANNOTATION_TOOL_NAME]).strip()
+        if tool in ['desktop-tensorflow','desktop-pytorch','jupyter-tensorflow','jupyter-pytorch']:
+            resources_flavor = 'desktop'
+        elif tool == 'analytic-engine':
+            resources_flavor = 'analytical-engine'
+        elif tool == 'chaimeleon-superset':
+            resources_flavor = 'superset'
+        else:
+            resources_flavor = 'otherDeployment'
+    else: # job
+        if ANNOTATION_JOB_RESOURCES_FLAVOR in body['metadata']['annotations']: 
+            resources_flavor = str(body['metadata']['annotations'][ANNOTATION_JOB_RESOURCES_FLAVOR]).strip().lower()
+        else:
+            resources_flavor = 'medium-gpu'
+    
+    if resources_flavor == 'small-gpu':           target_node = 'small-gpu';  cpu = '3';    maxcpu = '6';    memory = '28Gi'; gpu = True
+    elif resources_flavor == 'medium-gpu':        target_node = 'medium-gpu'; cpu = '7';    maxcpu = '8';    memory = '60Gi'; gpu = True
+    elif resources_flavor == 'large-gpu':         target_node = 'large-gpu';  cpu = '7';    maxcpu = '8';    memory = '60Gi'; gpu = True
+    elif resources_flavor == 'no-gpu':            target_node = 'no-gpu';     cpu = '7';    maxcpu = '8';    memory = '60Gi'; gpu = False
 
-    if type_of_job == 'desktop':      node_label_value = 'desktops';   cpu = '900m'; maxcpu = '2'; memory = '7Gi';  gpu = False
-    elif type_of_job == 'small-gpu':  node_label_value = 'small-gpu';  cpu = '3'; maxcpu = '6'; memory = '28Gi'; gpu = True
-    elif type_of_job == 'medium-gpu': node_label_value = 'medium-gpu'; cpu = '7'; maxcpu = '8'; memory = '60Gi'; gpu = True
-    elif type_of_job == 'large-gpu':  node_label_value = 'large-gpu';  cpu = '7'; maxcpu = '8'; memory = '60Gi'; gpu = True
-    elif type_of_job == 'no-gpu':     node_label_value = 'no-gpu';     cpu = '7'; maxcpu = '8'; memory = '60Gi'; gpu = False
-    else: raise kopf.AdmissionError(f"The annotation '{ANNOTATION_JOB_RESOURCES_FLAVOR}' has unkown value '{type_of_job}'.")
+    elif resources_flavor == 'desktop':           target_node = 'desktops';   cpu = '900m'; maxcpu = '2';    memory = '7Gi';  gpu = False
+    elif resources_flavor == 'analytical-engine': target_node = 'desktops';   cpu = '100m'; maxcpu = '200m'; memory = '1Gi';  gpu = False
+                                                  # analytical-engine has 7 deployments
+    elif resources_flavor == 'superset':          target_node = 'desktops';   cpu = '400m'; maxcpu = '400m'; memory = '3Gi';  gpu = False
+                                                  # superset has 1 deployment with 2 containers
+    elif resources_flavor == 'otherDeployment':   target_node = 'desktops';   cpu = '100m'; maxcpu = '200m'; memory = '1Gi';  gpu = False
+                                                  
+    else: raise kopf.AdmissionError(f"The annotation '{ANNOTATION_JOB_RESOURCES_FLAVOR}' has unkown value '{resources_flavor}'.")
 
     # Doc: 'nodeSelector' is the simplest method and 'nodeAffinity' is more powerfull
     # https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
-    node_selector = {'chaimeleon.eu/target': node_label_value}
+    node_selector = {'chaimeleon.eu/target': target_node}
     logger.debug("############# Adding nodeSelector: " + json.dumps(dict(node_selector)))
     set_value_in_patch(body, patch, 'spec:template:spec:nodeSelector', node_selector)
     # affinity = {
@@ -348,7 +367,7 @@ def set_nodeselector_and_resources_in_deployment_or_job(body, patch, logger, par
     #         'requiredDuringSchedulingIgnoredDuringExecution': {
     #             'nodeSelectorTerms': [{
     #                 'matchExpressions': [{
-    #                     'key': 'chaimeleon.eu/target', 'operator': 'In', 'values': [node_label_value]
+    #                     'key': 'chaimeleon.eu/target', 'operator': 'In', 'values': [target_node]
     #                 }]}]}}}
     # logger.debug("############# Adding affinity: " + json.dumps(dict(affinity)))
     # set_value_in_patch(body, patch, 'spec:template:spec:affinity', affinity)
@@ -359,15 +378,10 @@ def set_nodeselector_and_resources_in_deployment_or_job(body, patch, logger, par
     if gpu:
         resources["requests"]["nvidia.com/gpu"] = '1'
         resources["limits"]["nvidia.com/gpu"] = '1'
-    logger.debug("############# Adding resources: " + json.dumps(dict(resources)))
     num_containers = len(body['spec']['template']['spec']['containers'])
-    if num_containers == 0:
-        raise kopf.AdmissionError("0 containers detected.")
-    elif num_containers == 1:
-        set_value_in_patch(body, patch, 'spec:template:spec:containers#0:resources', resources)   # set the resources of the unique container
-    else:
-        # special case to be defined
-        return
+    logger.debug("############# Adding resources to %d containers: %s" % (num_containers, json.dumps(dict(resources))) )
+    for i in range(0, num_containers):
+        set_value_in_patch(body, patch, 'spec:template:spec:containers#%d:resources' % i, resources)
 
 def check_image(image):
     if INTERNAL_IMAGE_REPOSITORY_CHECK is None: return
@@ -391,9 +405,10 @@ def getImageFromFirstContainer(body):
 def get_cephfs_volumes_paths(body):
     volumes_paths = []
     spec = body['spec']['template']['spec']
-    for vol in spec['volumes']:
-        if 'cephfs' in vol:
-            volumes_paths.append(vol['cephfs']['path'])
+    if 'volumes' in spec:
+        for vol in spec['volumes']:
+            if 'cephfs' in vol:
+                volumes_paths.append(vol['cephfs']['path'])
     return volumes_paths
 
 def check_volumes_match_datasets(volumes_paths: list[str], datasets: list[str]):
@@ -423,10 +438,20 @@ def try_check_access_in_dataset_service_test(logger, access_token, username, use
 
 def prepare_deployment_or_job(name, body, patch, logger, username, is_job, is_admin):
     annotations = body['metadata']['annotations']
+    testingEnvironment = False
+
+    check_images(body)
+    datasets = []
+    if ANNOTATION_DATASETS_IDS in annotations and len(annotations[ANNOTATION_DATASETS_IDS]) > 0:
+        datasets = annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
+        if not isinstance(datasets, list):
+            raise kopf.AdmissionError(f"The annotation '{ANNOTATION_DATASETS_IDS}' must be a list of datasetsIDs sepparated with ','")
+        logger.debug("############# requested datasets: " + json.dumps(datasets))
 
     cephfs_volumes_paths = get_cephfs_volumes_paths(body)
     if len(cephfs_volumes_paths) > 0:
         logger.debug("############# cephfs volumes paths: " + json.dumps(cephfs_volumes_paths))
+        #check_volumes_match_datasets(cephfs_volumes_paths, datasets)
         if not is_admin or not 'securityContext' in body['spec']['template']['spec']:
             prev_security_context = body['spec']['template']['spec']['securityContext'] if 'securityContext' in body['spec']['template']['spec'] else None
             logger.debug("############# prev securityContext (SPEC): " + json.dumps(prev_security_context))
@@ -434,38 +459,27 @@ def prepare_deployment_or_job(name, body, patch, logger, username, is_job, is_ad
             logger.debug("############# Adding securityContext: " + json.dumps(dict(securityContext)))
             set_value_in_patch(body, patch, 'spec:template:spec:securityContext', securityContext)
 
-    access_token = get_access_token(logger)
-    if not access_token:
-        raise kopf.AdmissionError("Cannot validate the deployment, please retry in few minutes and if the problem persists contact the administrators.")
-    user_gid = get_user_gid(logger, access_token, username)
-    if user_gid is None:
-        raise kopf.AdmissionError("Cannot validate the deployment, please retry in few minutes and if the problem persists contact the administrators.")
-    logger.debug(f"############# Adding GID {str(user_gid)} to securityContext.supplementalGroups")
-    set_value_in_patch(body, patch, 'spec:template:spec:securityContext:supplementalGroups', [user_gid])
+        access_token = get_access_token(logger)
+        if not access_token:
+            raise kopf.AdmissionError("Cannot validate the deployment, please retry in few minutes and if the problem persists contact the administrators.")
+        user_gid = get_user_gid(logger, access_token, username)
+        if user_gid is None:
+            raise kopf.AdmissionError("Cannot validate the deployment, please retry in few minutes and if the problem persists contact the administrators.")
+        logger.debug(f"############# Adding GID {str(user_gid)} to securityContext.supplementalGroups")
+        set_value_in_patch(body, patch, 'spec:template:spec:securityContext:supplementalGroups', [user_gid])
 
-    check_images(body)
-    image = getImageFromFirstContainer(body)
-    datasets = []
-    if ANNOTATION_DATASETS_IDS in annotations and len(annotations[ANNOTATION_DATASETS_IDS]) > 0:
-        datasets = annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
-        if not isinstance(datasets, list):
-            raise kopf.AdmissionError(f"The annotation '{ANNOTATION_DATASETS_IDS}' must be a list of datasetsIDs sepparated with ','")
-    #check_volumes_match_datasets(cephfs_volumes_paths, datasets)
-    testingEnvironment = False
-    if len(datasets) == 0:
-        logger.info(f"User {username} will deploy {image} without datasets")
-    else:
-        # Check with Dataset Service if the user can use the datasets requested
-        access_checked = check_access_dataset(logger, access_token, username, datasets, DATASET_SERVICE_ENDPOINT)
-        if len(access_checked["denied"])>0:
-            logger.warning(f"User {username} is trying to use dataset(s) that is not allowed or not exist: " + str(access_checked["denied"]))
-            if access_checked['return_code'] == 403 and len(access_checked["granted"]) == 0 and DATASET_SERVICE_TEST_ENDPOINT != None:
-                ok = try_check_access_in_dataset_service_test(logger, access_token, username, user_gid, datasets, body, patch)
-                if ok: testingEnvironment = True
-                else: raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
-            else:
-                raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
-
+        if len(datasets) > 0:
+            if not access_token: raise kopf.AdmissionError("Unexpected error.")
+            # Check with Dataset Service if the user can use the datasets requested
+            access_checked = check_access_dataset(logger, access_token, username, datasets, DATASET_SERVICE_ENDPOINT)
+            if len(access_checked["denied"])>0:
+                logger.warning(f"User {username} is trying to use dataset(s) that is not allowed or not exist: " + str(access_checked["denied"]))
+                if access_checked['return_code'] == 403 and len(access_checked["granted"]) == 0 and DATASET_SERVICE_TEST_ENDPOINT != None:
+                    ok = try_check_access_in_dataset_service_test(logger, access_token, username, user_gid, datasets, body, patch)
+                    if ok: testingEnvironment = True
+                    else: raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
+                else:
+                    raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
 
     # Store some info required later
     newAnnotations = {}
