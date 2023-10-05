@@ -124,6 +124,9 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     # The garbage collector sometimes mutates a deployment before delete
     SYSTEM_SERVICE_ACCOUNTS.append("system:serviceaccount:kube-system:generic-garbage-collector")
 
+ANNOTATION_PERSISTENT_HOME_MOUNT_POINT = "chaimeleon.eu/persistentHomeMountPoint"
+ANNOTATION_PERSISTENT_SHARED_FOLDER_MOUNT_POINT = "chaimeleon.eu/persistentSharedFolderMountPoint"
+ANNOTATION_DATASETS_MOUNT_POINT = "chaimeleon.eu/datasetsMountPoint"
 ANNOTATION_DATASETS_IDS = "chaimeleon.eu/datasetsIDs"
 ANNOTATION_TOOL_NAME = "chaimeleon.eu/toolName"
 ANNOTATION_TOOL_VERSION = "chaimeleon.eu/toolVersion"
@@ -133,7 +136,7 @@ ANNOTATION_GUACAMOLE_CONNECTION_NAME = "chaimeleon.eu/guacamoleConnectionName"
 ANNOTATION_JOB_RESOURCES_FLAVOR = "chaimeleon.eu/jobResourcesFlavor"
 ANNOTATION_TESTING_ENVIRONMENT = "chaimeleon.eu/testingEnvironment"
 
-DATASET_ACCESS_ANNOTATIONS = {ANNOTATION_DATASETS_IDS: kopf.PRESENT, ANNOTATION_TOOL_NAME: kopf.PRESENT, ANNOTATION_TOOL_VERSION: kopf.PRESENT}
+#DATASET_ACCESS_ANNOTATIONS = {ANNOTATION_DATASETS_IDS: kopf.PRESENT, ANNOTATION_TOOL_NAME: kopf.PRESENT, ANNOTATION_TOOL_VERSION: kopf.PRESENT}
 ADMINS_GROUP = "oidc:cloud-services-and-security-management"
 
 def is_user_namespace(namespace, **_):
@@ -319,6 +322,7 @@ def create_hierarchy_in_patch(body, patch, path: str):
 def set_value_in_patch(body, patch, path: str, value):
     ''' Set the indicated value in the patch at the path especified, creating empty objects if not exists to define the path.
         Example: set_value_in_patch(patch, 'spec:template:spec:nodeSelector:chaimeleon.eu/target', 'medium-gpu')
+        If there is any array in the path, it will be entirely copied from the body; this is the reason for the param 'body' is required.
     '''
     current = create_hierarchy_in_patch(body, patch, path)
     key = path[path.rindex(':')+1:]
@@ -417,41 +421,99 @@ def check_volumes_match_datasets(volumes_paths: list[str], datasets: list[str]):
         if i == -1: continue  # the path not corresponds with a dataset 
         dataset_id = vol_path[i+10:]
         if dataset_id not in datasets:
-            raise kopf.AdmissionError(f"There is one volume corresponding to a dataset not declared in the annotation '{ANNOTATION_DATASETS_IDS}'")    
+            raise kopf.AdmissionError(f"There is one volume corresponding to a dataset not declared in the annotation '{ANNOTATION_DATASETS_IDS}'")
 
-def try_check_access_in_dataset_service_test(logger, access_token, username, user_gid, datasets, body, patch):
-    logger.warning("############# Trying to check the access in the Dataset-service test endpoint...")
-    # This is needed to synchronize the DB of the test service with the production DB which is the "master" provider of user GIDs.
-    put_user_gid_in_test_dataset_service(logger, access_token, username, user_gid)
-    access_checked = check_access_dataset(logger, access_token, username, datasets, DATASET_SERVICE_TEST_ENDPOINT)
-    if len(access_checked["denied"])>0:
-        return False
+def build_cephfs_volume(username: str, name: str, path: str, read_only: bool = False):
+    return { 'name': name,
+             'cephfs': {
+                'monitors': [ '192.168.3.37:6789', '192.168.3.22:6789', '192.168.3.49:6789', '192.168.3.11:6789' ],
+                'path': path,
+                'user': 'chaimeleon-' + username,
+                'secretRef': {'name': 'ceph-auth'},
+                'readOnly': read_only
+             } }
 
-    logger.debug("############# Changing paths of volumes (datalake and datasets) for testing environment")
-    set_value_in_patch(body, patch, 'spec:template:spec:volumes', body['spec']['template']['spec']['volumes'])
-    for vol in patch['spec']['template']['spec']['volumes']:
-        if vol['name'] == 'datalake':
-            vol['cephfs']['path'] = "/datalake-test"
-        if str(vol['cephfs']['path']).startswith('/datasets/'):
-            vol['cephfs']['path'] = "/datasets-test/"+vol['name']
-    return True
-
-def prepare_deployment_or_job(name, body, patch, logger, username, is_job, is_admin):
+def add_volumes_from_annotations(body, patch, logger, username):
+    cephfs_volumes_paths = get_cephfs_volumes_paths(body)
+    logger.debug("############# previous cephfs volumes paths: " + json.dumps(cephfs_volumes_paths))
     annotations = body['metadata']['annotations']
-    testingEnvironment = False
-
-    check_images(body)
     datasets = []
     if ANNOTATION_DATASETS_IDS in annotations and len(annotations[ANNOTATION_DATASETS_IDS]) > 0:
         datasets = annotations[ANNOTATION_DATASETS_IDS].replace(" ", "").split(",")
         if not isinstance(datasets, list):
             raise kopf.AdmissionError(f"The annotation '{ANNOTATION_DATASETS_IDS}' must be a list of datasetsIDs sepparated with ','")
-        logger.debug("############# requested datasets: " + json.dumps(datasets))
+    datasets_mount_path = ""
+    datalake_mount_path = ""
+    if len(datasets) > 0:
+        datasets_mount_path = annotations[ANNOTATION_DATASETS_MOUNT_POINT] if ANNOTATION_DATASETS_MOUNT_POINT in annotations else "/home/chaimeleon/datasets"
+        datalake_mount_path = "/mnt/datalake"
+    persistent_home_mount_path = annotations[ANNOTATION_PERSISTENT_HOME_MOUNT_POINT] if ANNOTATION_PERSISTENT_HOME_MOUNT_POINT in annotations else ""
+    persistent_shared_folder_mount_path = annotations[ANNOTATION_PERSISTENT_SHARED_FOLDER_MOUNT_POINT] if ANNOTATION_PERSISTENT_SHARED_FOLDER_MOUNT_POINT in annotations else ""
 
-    cephfs_volumes_paths = get_cephfs_volumes_paths(body)
+    if datalake_mount_path != "" or persistent_home_mount_path != "" or persistent_shared_folder_mount_path != "":
+        # we are going to change the volumes, let's copy them from body to patch or create an empty array
+        spec = body['spec']['template']['spec']
+        set_value_in_patch(body, patch, 'spec:template:spec:volumes', spec['volumes'] if 'volumes' in spec else [])
+        # and the same with volumeMounts of the first container
+        set_value_in_patch(body, patch, 'spec:template:spec:containers#0:volumeMounts', spec['containers'][0]['volumeMounts'] if 'volumeMounts' in spec['containers'][0] else [])
+
+        volumes = patch['spec']['template']['spec']['volumes']
+        volume_mounts = patch['spec']['template']['spec']['containers'][0]['volumeMounts']
+
+        if datalake_mount_path != "":
+            if not '/datalake' in cephfs_volumes_paths:
+                name = 'datalake'
+                volumes.append(build_cephfs_volume(username, name=name, path='/datalake', read_only=True))
+                volume_mounts.append({'name': name, 'mountPath': datalake_mount_path})
+            logger.debug("############# requested datasets: " + json.dumps(datasets))
+            for ds in datasets:
+                if not '/datasets/'+ds in cephfs_volumes_paths:
+                    volumes.append(build_cephfs_volume(username, name=ds, path='/datasets/' + ds, read_only=True))
+                    volume_mounts.append({'name': ds, 'mountPath': datasets_mount_path + '/' + ds})
+
+        if persistent_home_mount_path != "":
+            if not '/homes/chaimeleon-users/' + username in cephfs_volumes_paths:
+                name = 'home'
+                volumes.append(build_cephfs_volume(username, name=name, path='/homes/chaimeleon-users/' + username))
+                volume_mounts.append({'name': name, 'mountPath': persistent_home_mount_path})
+                
+        if persistent_shared_folder_mount_path != "":
+            if not '/homes/chaimeleon-shared-folder' in cephfs_volumes_paths:
+                name = 'shared-folder'
+                volumes.append(build_cephfs_volume(username, name=name, path='/homes/chaimeleon-shared-folder'))
+                volume_mounts.append({'name': name, 'mountPath': persistent_shared_folder_mount_path})
+
+        cephfs_volumes_paths = get_cephfs_volumes_paths(patch)
+    logger.debug("############# final cephfs volumes paths: " + json.dumps(cephfs_volumes_paths))
+    return cephfs_volumes_paths, datasets
+
+def try_check_access_in_dataset_service_test(logger, access_token, username, user_gid, datasets, body, patch):
+    # This is needed to synchronize the DB of the test service with the production DB which is the "master" provider of user GIDs.
+    logger.debug("############# Updating GID in Dataset-service-test...")
+    put_user_gid_in_test_dataset_service(logger, access_token, username, user_gid)
+
+    logger.debug("############# Trying to check the access in the Dataset-service test endpoint...")
+    access_checked = check_access_dataset(logger, access_token, username, datasets, DATASET_SERVICE_TEST_ENDPOINT)
+    if len(access_checked["denied"])>0: return False
+
+    logger.debug("############# Changing paths of volumes (datalake and datasets) for testing environment")
+    if not 'volumes' in patch['spec']['template']['spec']:
+        set_value_in_patch(body, patch, 'spec:template:spec:volumes', body['spec']['template']['spec']['volumes'])
+    for vol in patch['spec']['template']['spec']['volumes']:
+        if vol['name'] == 'datalake' and 'cephfs' in vol:
+            vol['cephfs']['path'] = "/datalake-test"
+        if 'cephfs' in vol and str(vol['cephfs']['path']).startswith('/datasets/'):
+            vol['cephfs']['path'] = "/datasets-test/"+vol['name']
+    return True
+
+def prepare_deployment_or_job(name, body, patch, logger, username, is_job, is_admin):
+    testingEnvironment = False
+
+    check_images(body)
+    #delete_cephfs_volumes(body)   they are not required, instead they will be created by this operator from the annotations
+    ##check_volumes_match_datasets(cephfs_volumes_paths, datasets)
+    cephfs_volumes_paths, datasets = add_volumes_from_annotations(body, patch, logger, username)
     if len(cephfs_volumes_paths) > 0:
-        logger.debug("############# cephfs volumes paths: " + json.dumps(cephfs_volumes_paths))
-        #check_volumes_match_datasets(cephfs_volumes_paths, datasets)
         if not is_admin or not 'securityContext' in body['spec']['template']['spec']:
             prev_security_context = body['spec']['template']['spec']['securityContext'] if 'securityContext' in body['spec']['template']['spec'] else None
             logger.debug("############# prev securityContext (SPEC): " + json.dumps(prev_security_context))
@@ -482,6 +544,7 @@ def prepare_deployment_or_job(name, body, patch, logger, username, is_job, is_ad
                     raise kopf.AdmissionError("Access denied to the following datasets: " + str(access_checked["denied"]))
 
     # Store some info required later
+    annotations = body['metadata']['annotations']
     newAnnotations = {}
     newAnnotations[ANNOTATION_USERNAME] = username
     newAnnotations[ANNOTATION_TESTING_ENVIRONMENT] = str(testingEnvironment)
