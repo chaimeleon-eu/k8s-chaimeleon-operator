@@ -35,7 +35,7 @@ GUACAMOLE_USER = None
 GUACAMOLE_PASSWORD = None
 GUACAMOLE_CONNECTIONS_BACKEND_HOST = 'guacamole-guacd.guacamole.svc.cluster.local'
 GUACAMOLE_CONNECTIONS_VNC_PORT = '5900'
-GUACAMOLE_CONNECTIONS_SFTP_USERNAME = 'chaimeleon'
+GUACAMOLE_CONNECTIONS_SFTP_DEFAULT_USERNAME = 'chaimeleon'
 GUACAMOLE_CONNECTIONS_SFTP_PORT = '2222'
 
 @kopf.on.login(retries=3)
@@ -49,7 +49,7 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     global DEFAULT_KEYCLOAK_MAX_RETRIES, KEYCLOAK_MAX_RETRIES, DEFAULT_DATASET_SERVICE_MAX_RETRIES, DATASET_SERVICE_MAX_RETRIES
     global K8S_USER_PREFIX, OPERATOR_SERVICE_ACCOUNT_NAMESPACE, OPERATOR_SERVICE_ACCOUNT_NAME, SYSTEM_SERVICE_ACCOUNTS
     global GUACAMOLE_URL, GUACAMOLE_USER, GUACAMOLE_PASSWORD, GUACAMOLE_CONNECTIONS_BACKEND_HOST
-    global GUACAMOLE_CONNECTIONS_VNC_PORT, GUACAMOLE_CONNECTIONS_SFTP_USERNAME, GUACAMOLE_CONNECTIONS_SFTP_PORT
+    global GUACAMOLE_CONNECTIONS_VNC_PORT, GUACAMOLE_CONNECTIONS_SFTP_DEFAULT_USERNAME, GUACAMOLE_CONNECTIONS_SFTP_PORT
     global INTERNAL_IMAGE_REPOSITORY_CHECK
 
     # Required ENV vars
@@ -78,7 +78,7 @@ def config(settings: kopf.OperatorSettings, logger, **_):
     GUACAMOLE_PASSWORD = os.environ.get('GUACAMOLE_PASSWORD', GUACAMOLE_PASSWORD)
     GUACAMOLE_CONNECTIONS_BACKEND_HOST = os.environ.get('GUACAMOLE_CONNECTIONS_BACKEND_HOST', GUACAMOLE_CONNECTIONS_BACKEND_HOST)
     GUACAMOLE_CONNECTIONS_VNC_PORT = os.environ.get('GUACAMOLE_CONNECTIONS_VNC_PORT', GUACAMOLE_CONNECTIONS_VNC_PORT)
-    GUACAMOLE_CONNECTIONS_SFTP_USERNAME = os.getenv('GUACAMOLE_CONNECTIONS_SFTP_USERNAME', GUACAMOLE_CONNECTIONS_SFTP_USERNAME)
+    GUACAMOLE_CONNECTIONS_SFTP_DEFAULT_USERNAME = os.getenv('GUACAMOLE_CONNECTIONS_SFTP_DEFAULT_USERNAME', GUACAMOLE_CONNECTIONS_SFTP_DEFAULT_USERNAME)
     GUACAMOLE_CONNECTIONS_SFTP_PORT = os.getenv('GUACAMOLE_CONNECTIONS_SFTP_PORT', GUACAMOLE_CONNECTIONS_SFTP_PORT)
 
     #logger.info("OPERATOR_SERVICE_HOST=%s" % (OPERATOR_SERVICE_HOST))
@@ -228,14 +228,17 @@ def get_guacamole_client(url):
         connection = http.client.HTTPSConnection(urlp.hostname, port)
     return guac.GuacamoleClient(connection, urlp.path)
 
-def get_container_password_from_secret(secret_name, namespace):
+def get_container_user_and_password_from_secret(secret_name, namespace):
     #kubernetes.config.load_kube_config()
     kubernetes.config.load_incluster_config()
     api = kubernetes.client.CoreV1Api()
     secret = api.read_namespaced_secret(secret_name, namespace)
+    user = secret.data["container-user"] if "container-user" in secret.data else None
+    if user != None: 
+        user = base64.b64decode(user).decode('utf-8')
     password = secret.data["container-password"]
-    decoded = base64.b64decode(password).decode('utf-8')
-    return decoded
+    password = base64.b64decode(password).decode('utf-8')
+    return user, password
 
 def create_guacamole_connection(name, namespace, spec, annotations, logger):
     if GUACAMOLE_URL is None: return   # Guacamole connection creation is disabled
@@ -250,13 +253,14 @@ def create_guacamole_connection(name, namespace, spec, annotations, logger):
     if connectionGroupId is None: logger.warning('Connection group "'+username+'" not found.'); return
 
     connectionName = annotations[ANNOTATION_GUACAMOLE_CONNECTION_NAME]
+    container_user, container_password = get_container_user_and_password_from_secret(name, namespace)
+    logger.debug("############# SECRET content (user, password): %s, %s" % (container_user, container_password))
     vnc_host = f"{name}.{namespace}.svc.cluster.local"   # A k8s service with the same name should be created in the same namespace
     vnc_port = GUACAMOLE_CONNECTIONS_VNC_PORT
-    vnc_password = get_container_password_from_secret(name, namespace)
-    logger.debug("############# SECRET content: "+ vnc_password)
+    vnc_password = container_password
     sftp_port = GUACAMOLE_CONNECTIONS_SFTP_PORT
-    sftp_user = GUACAMOLE_CONNECTIONS_SFTP_USERNAME
-    sftp_password = vnc_password
+    sftp_user = container_user if container_user != None else GUACAMOLE_CONNECTIONS_SFTP_DEFAULT_USERNAME
+    sftp_password = container_password
     logger.debug('Creating VNC connection for '+vnc_host+':'+vnc_port)
     connectionId = client.createVncConnection(connectionName, connectionGroupId, GUACAMOLE_CONNECTIONS_BACKEND_HOST, 
                                             vnc_host, vnc_port, vnc_password, sftp_user, sftp_password, sftp_port, 

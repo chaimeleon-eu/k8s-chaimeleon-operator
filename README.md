@@ -38,3 +38,10 @@ Annotations for mounting CHAIMELEON volumes:
    It is optional, default value: `/home/chaimeleon/datasets`.  
    Example: `chaimeleon.eu/datasetsMountPoint: "/home/chaimeleon/datasets"`
 
+ - **guacamole connection** (for remote desktops)
+   `chaimeleon.eu/createGuacamoleConnection: "true"`
+   It is optional, if exist then there must be also a Secret in the same namespace, with the same name of the deployment 
+   and containing the following entries:
+    - `container-user`: Optional, default value is "chaimeleon". The username for connecting to the SFTP/SSH server
+    - `container-password`: the password for connecting to the VNC server and the SFTP/SSH server.
+
